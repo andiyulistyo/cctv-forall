@@ -1,0 +1,24 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: detection-dashboard:cpu
+    container_name: detection-dashboard
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persists SQLite DB and cropped plate images across restarts.
+      - ./data:/app/data
+    environment:
+      # Change these before exposing the app anywhere real.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      # Detection tuning
+      DEVICE: ${DEVICE:-}            # empty = auto (cpu here)
+      FRAME_STRIDE: ${FRAME_STRIDE:-2}
+      CONF_THRESHOLD: ${CONF_THRESHOLD:-0.35}
+      ALPR_ENABLED: ${ALPR_ENABLED:-true}
+      RETENTION_DAYS: ${RETENTION_DAYS:-7}
+    restart: unless-stopped

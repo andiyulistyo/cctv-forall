@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# GPU (CUDA) image. Use together with docker-compose.gpu.yml on a host that
+# has an NVIDIA GPU + the NVIDIA Container Toolkit installed.
+
+# ---------- Stage 1: build the React frontend ----------
+FROM node:20-slim AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+# ---------- Stage 2: CUDA python backend ----------
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS backend
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3-pip python3.11-dev \
+    ffmpeg libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+# CUDA build of torch/torchvision (cu124).
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cu124
+
+WORKDIR /app/backend
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p /app/weights && cd /app/weights \
+    && python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')" \
+    && python -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
+
+COPY backend/ /app/backend/
+COPY --from=frontend /frontend/dist /app/frontend/dist
+
+ENV YOLO_MODEL=/app/weights/yolo11n.pt \
+    DATA_DIR=/app/data \
+    DEVICE=cuda \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

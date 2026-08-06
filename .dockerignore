@@ -1,0 +1,11 @@
+**/__pycache__/
+**/*.pyc
+frontend/node_modules/
+frontend/dist/
+data/
+.git/
+.venv/
+*.db
+*.db-wal
+*.db-shm
+.env

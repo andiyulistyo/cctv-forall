@@ -1,0 +1,17 @@
+# GPU override. Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+# Requires NVIDIA Container Toolkit on the host.
+services:
+  app:
+    build:
+      dockerfile: Dockerfile.gpu
+    image: detection-dashboard:gpu
+    environment:
+      DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

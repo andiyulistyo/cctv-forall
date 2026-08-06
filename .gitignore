@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data (SQLite DB + plate images + weights)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Env
+.env

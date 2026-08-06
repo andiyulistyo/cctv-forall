@@ -1,0 +1,32 @@
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# --- Database ---
+SQLAlchemy==2.0.37
+
+# --- Auth ---
+bcrypt==4.2.1
+PyJWT==2.10.1
+
+# --- Scheduling / retention ---
+APScheduler==3.11.0
+
+# --- Computer vision / detection ---
+# NOTE: torch is installed separately in the Dockerfile so we can pick the
+# correct CPU vs CUDA wheel. It is intentionally NOT pinned here.
+ultralytics==8.3.63
+opencv-python-headless==4.11.0.86
+numpy==2.1.3
+Pillow==11.1.0
+
+# --- Source input ---
+# Unpinned on purpose: YouTube changes frequently and only recent yt-dlp
+# releases can extract current formats. Rebuild to pull the latest.
+yt-dlp
+
+# --- ANPR / OCR (Indonesian plates) ---
+easyocr==1.7.2
