@@ -10,7 +10,7 @@ from sqlalchemy import delete, select
 
 from .config import settings
 from .database import SessionLocal
-from .models import CountEvent, PlateRead
+from .models import CountEvent, FaceSighting, PlateRead
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -23,6 +23,7 @@ def purge_old_data() -> dict:
     db = SessionLocal()
     removed_events = 0
     removed_plates = 0
+    removed_sightings = 0
     try:
         # Delete plate images on disk first, then their rows.
         old_plates = db.scalars(
@@ -39,6 +40,21 @@ def purge_old_data() -> dict:
             delete(PlateRead).where(PlateRead.timestamp < cutoff)
         ).rowcount or 0
 
+        # Face sightings (EnrolledFace is reference data and never purged).
+        old_sightings = db.scalars(
+            select(FaceSighting).where(FaceSighting.timestamp < cutoff)
+        ).all()
+        for fs in old_sightings:
+            if fs.image_path:
+                fpath = settings.data_dir / fs.image_path
+                try:
+                    fpath.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        removed_sightings = db.execute(
+            delete(FaceSighting).where(FaceSighting.timestamp < cutoff)
+        ).rowcount or 0
+
         removed_events = db.execute(
             delete(CountEvent).where(CountEvent.timestamp < cutoff)
         ).rowcount or 0
@@ -47,7 +63,11 @@ def purge_old_data() -> dict:
         db.rollback()
     finally:
         db.close()
-    return {"count_events": removed_events, "plate_reads": removed_plates}
+    return {
+        "count_events": removed_events,
+        "plate_reads": removed_plates,
+        "face_sightings": removed_sightings,
+    }
 
 
 def start_scheduler() -> None:

@@ -51,6 +51,7 @@ class SourceBase(BaseModel):
     url: str
     enabled_classes: list[str] = Field(default_factory=lambda: ["car", "truck", "motorcycle"])
     alpr_enabled: bool = True
+    face_enabled: bool = False
 
     def validate_semantics(self) -> None:
         if self.type not in SOURCE_TYPES:
@@ -69,6 +70,7 @@ class SourceUpdate(BaseModel):
     url: str | None = None
     enabled_classes: list[str] | None = None
     alpr_enabled: bool | None = None
+    face_enabled: bool | None = None
 
 
 class SourceOut(SourceBase):
@@ -114,6 +116,35 @@ class PlateOut(BaseModel):
     vehicle_class: str
     plate_text: str
     confidence: float
+    has_image: bool
+    timestamp: datetime
+
+    model_config = {"from_attributes": True}
+
+    @field_serializer("timestamp")
+    def _ser_timestamp(self, v: datetime) -> str | None:
+        return _as_utc_iso(v)
+
+
+# --- Faces ---
+class EnrolledFaceOut(BaseModel):
+    id: int
+    name: str
+    has_image: bool
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @field_serializer("created_at")
+    def _ser_created_at(self, v: datetime) -> str | None:
+        return _as_utc_iso(v)
+
+
+class FaceSightingOut(BaseModel):
+    id: int
+    source_id: int
+    name: str | None
+    similarity: float
     has_image: bool
     timestamp: datetime
 

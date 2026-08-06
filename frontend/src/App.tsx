@@ -4,6 +4,7 @@ import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import SourceDetail from "./pages/SourceDetail";
 import Plates from "./pages/Plates";
+import Faces from "./pages/Faces";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const { isAuthed } = useAuth();
@@ -22,6 +23,9 @@ function NavBar() {
       </Link>
       <Link className="hover:text-sky-300" to="/plates">
         Plat Nomor
+      </Link>
+      <Link className="hover:text-sky-300" to="/faces">
+        Wajah
       </Link>
       <button
         onClick={logout}
@@ -72,6 +76,16 @@ export default function App() {
           <RequireAuth>
             <Shell>
               <Plates />
+            </Shell>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/faces"
+        element={
+          <RequireAuth>
+            <Shell>
+              <Faces />
             </Shell>
           </RequireAuth>
         }

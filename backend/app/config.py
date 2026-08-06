@@ -48,6 +48,21 @@ class Settings(BaseSettings):
     # EasyOCR languages. Indonesian plates use latin characters -> "en".
     ocr_languages: str = "en"
 
+    # --- Face recognition (OpenCV YuNet + SFace) ---
+    face_enabled: bool = True
+    # ONNX model paths. Empty => default under weights_dir/face/. In Docker these
+    # are prefetched and pointed at via env (YUNET_MODEL / SFACE_MODEL).
+    yunet_model: str = ""
+    sface_model: str = ""
+    # Cosine similarity threshold for SFace (recommended ~0.363).
+    face_similarity_threshold: float = 0.363
+    # YuNet detector input size (smaller = faster on CPU).
+    face_det_size: int = 320
+    # Log unknown (unrecognized) faces as sightings too?
+    face_log_unknown: bool = False
+    # Don't log the same identity on a source more often than this (seconds).
+    face_sighting_cooldown_sec: int = 20
+
     # --- Retention ---
     retention_days: int = 7
     retention_interval_minutes: int = 60
@@ -68,10 +83,23 @@ class Settings(BaseSettings):
     def weights_dir(self) -> Path:
         return self.data_dir / "weights"
 
+    @property
+    def faces_dir(self) -> Path:
+        return self.data_dir / "faces"
+
+    @property
+    def yunet_model_path(self) -> str:
+        return self.yunet_model or str(self.weights_dir / "face" / "yunet.onnx")
+
+    @property
+    def sface_model_path(self) -> str:
+        return self.sface_model or str(self.weights_dir / "face" / "sface.onnx")
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.plates_dir.mkdir(parents=True, exist_ok=True)
         self.weights_dir.mkdir(parents=True, exist_ok=True)
+        self.faces_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

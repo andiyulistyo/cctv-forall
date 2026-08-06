@@ -61,6 +61,7 @@ class Source(Base):
     )
 
     alpr_enabled: Mapped[bool] = mapped_column(Integer, default=1)
+    face_enabled: Mapped[bool] = mapped_column(Integer, default=0)
 
     # Runtime status: stopped | starting | running | error
     status: Mapped[str] = mapped_column(String(20), default="stopped")
@@ -72,6 +73,9 @@ class Source(Base):
         back_populates="source", cascade="all, delete-orphan"
     )
     plate_reads: Mapped[list["PlateRead"]] = relationship(
+        back_populates="source", cascade="all, delete-orphan"
+    )
+    face_sightings: Mapped[list["FaceSighting"]] = relationship(
         back_populates="source", cascade="all, delete-orphan"
     )
 
@@ -110,3 +114,36 @@ class PlateRead(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     source: Mapped[Source] = relationship(back_populates="plate_reads")
+
+
+class EnrolledFace(Base):
+    """A registered person's reference face embedding (NOT subject to retention).
+
+    One row per enrolled photo; ``name`` may repeat across rows so a person can
+    be enrolled from several photos for better recognition.
+    """
+
+    __tablename__ = "enrolled_faces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), index=True)
+    embedding: Mapped[list] = mapped_column(JSON)  # 128 floats
+    image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class FaceSighting(Base):
+    """A recognized (or unknown) face seen on a source. Retained 7 days."""
+
+    __tablename__ = "face_sightings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+    source: Mapped[Source] = relationship(back_populates="face_sightings")

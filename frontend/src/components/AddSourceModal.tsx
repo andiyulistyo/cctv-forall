@@ -23,6 +23,7 @@ export default function AddSourceModal({
   const [url, setUrl] = useState("");
   const [classes, setClasses] = useState<string[]>(["car", "truck", "motorcycle"]);
   const [alpr, setAlpr] = useState(true);
+  const [face, setFace] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -39,6 +40,7 @@ export default function AddSourceModal({
         url,
         enabled_classes: classes,
         alpr_enabled: alpr,
+        face_enabled: face,
       });
       onCreated();
       onClose();
@@ -94,9 +96,14 @@ export default function AddSourceModal({
           <ClassSelector value={classes} onChange={setClasses} />
         </div>
 
-        <label className="mb-4 flex items-center gap-2 text-sm text-slate-300">
+        <label className="mb-2 flex items-center gap-2 text-sm text-slate-300">
           <input type="checkbox" checked={alpr} onChange={(e) => setAlpr(e.target.checked)} />
           Baca plat nomor (ANPR) untuk kendaraan
+        </label>
+
+        <label className="mb-4 flex items-center gap-2 text-sm text-slate-300">
+          <input type="checkbox" checked={face} onChange={(e) => setFace(e.target.checked)} />
+          Pengenalan wajah (face recognition)
         </label>
 
         {error && <div className="mb-3 text-sm text-red-400">{error}</div>}

@@ -16,7 +16,7 @@ from .database import SessionLocal, init_db
 from .detection.manager import get_manager, init_manager
 from .models import Source
 from .retention import start_scheduler, stop_scheduler
-from .api import auth_routes, counts, plates, sources, streams
+from .api import auth_routes, counts, faces, plates, sources, streams
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
@@ -65,6 +65,7 @@ app.include_router(sources.router)
 app.include_router(streams.router)
 app.include_router(counts.router)
 app.include_router(plates.router)
+app.include_router(faces.router)
 
 
 class SPAStaticFiles(StaticFiles):

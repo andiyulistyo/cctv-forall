@@ -13,6 +13,7 @@ export interface Source {
   url: string;
   enabled_classes: string[];
   alpr_enabled: boolean;
+  face_enabled: boolean;
   line: { a: number[]; b: number[] } | null;
   direction_labels: { in: string; out: string };
   status: string;
@@ -44,6 +45,22 @@ export interface Plate {
   vehicle_class: string;
   plate_text: string;
   confidence: number;
+  has_image: boolean;
+  timestamp: string;
+}
+
+export interface EnrolledFace {
+  id: number;
+  name: string;
+  has_image: boolean;
+  created_at: string;
+}
+
+export interface Sighting {
+  id: number;
+  source_id: number;
+  name: string | null;
+  similarity: number;
   has_image: boolean;
   timestamp: string;
 }
@@ -117,9 +134,38 @@ export const api = {
   listPlates: (sourceId?: number, limit = 100) =>
     request<Plate[]>(`/plates?limit=${limit}${sourceId ? `&source=${sourceId}` : ""}`),
 
+  // --- Faces ---
+  listFaces: () => request<EnrolledFace[]>("/faces"),
+  deleteFace: (id: number) => request<void>(`/faces/${id}`, { method: "DELETE" }),
+  async enrollFace(name: string, file: File): Promise<EnrolledFace> {
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("image", file);
+    const token = getToken();
+    const res = await fetch(`${BASE}/faces/enroll`, {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: fd, // browser sets multipart Content-Type + boundary
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        detail = (await res.json()).detail ?? detail;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(res.status, detail);
+    }
+    return (await res.json()) as EnrolledFace;
+  },
+  listSightings: (sourceId?: number, limit = 100) =>
+    request<Sighting[]>(`/sightings?limit=${limit}${sourceId ? `&source=${sourceId}` : ""}`),
+
   // Media URLs (token via query string for <img>/stream tags)
   streamUrl: (id: number) => `${BASE}/streams/${id}?token=${getToken() ?? ""}`,
   plateImageUrl: (id: number) => `${BASE}/plates/${id}/image?token=${getToken() ?? ""}`,
+  faceImageUrl: (id: number) => `${BASE}/faces/${id}/image?token=${getToken() ?? ""}`,
+  sightingImageUrl: (id: number) => `${BASE}/sightings/${id}/image?token=${getToken() ?? ""}`,
 
   async snapshotBlobUrl(id: number): Promise<string> {
     const token = getToken();

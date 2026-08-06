@@ -17,6 +17,10 @@ lalu lintas (mobil, orang, truk, motor, bus) dari berbagai sumber video, dengan
   akurat dan tidak double-count (lihat `backend/app/detection/line_counter.py`).
 - 🚗 **ANPR / Plat nomor**: membaca plat kendaraan (format Indonesia) via
   EasyOCR, menyimpan teks + potongan gambar ke database lokal.
+- 🧑 **Pengenalan wajah (face recognition)**: daftarkan orang (nama + foto),
+  sistem mengenali wajah pada stream (label nama) dan mencatat kemunculan
+  (sighting) ke DB. Ringan & OpenCV-native (**YuNet** deteksi + **SFace**
+  embedding), toggle per source. Wajah asing = "unknown".
 - 🗄️ **Penyimpanan lokal (SQLite)** dengan **retensi otomatis 7 hari**.
 - 🔐 **Login** (satu admin, JWT).
 - 🐳 **Docker** untuk distribusi mudah (CPU & GPU).
@@ -106,6 +110,8 @@ otomatis menyajikan `frontend/dist`.
 | `FRAME_STRIDE` | 2 | proses 1 dari N frame (hemat CPU) |
 | `CONF_THRESHOLD` | 0.35 | ambang confidence deteksi |
 | `ALPR_ENABLED` | true | aktif/nonaktif ANPR global |
+| `FACE_ENABLED` | true | aktif/nonaktif face recognition global |
+| `FACE_SIMILARITY_THRESHOLD` | 0.363 | ambang cosine SFace (lebih tinggi = lebih ketat) |
 | `RETENTION_DAYS` | 7 | umur data sebelum dihapus |
 
 ## Testing logika line counting
@@ -121,6 +127,24 @@ PYTHONPATH=. python tests/test_line_counter.py
 - **GPU**: bisa model lebih besar & lebih banyak stream.
 - **Akurasi ANPR** bergantung resolusi/sudut/pencahayaan CCTV; hasil disimpan
   beserta nilai confidence. ANPR bisa dimatikan per source untuk menghemat CPU.
+- **Face recognition (YuNet + SFace)** ringan tapi akurasinya bukan kelas
+  InsightFace/ArcFace; paling baik untuk wajah frontal & jelas. Enrol beberapa
+  foto per orang untuk hasil lebih stabil. Cocokkan `FACE_SIMILARITY_THRESHOLD`
+  bila terlalu banyak false match (naikkan) atau sering "unknown" (turunkan).
+
+## Pengenalan Wajah (Face Recognition)
+
+1. Buka menu **Wajah** → **Daftarkan Orang**: isi nama + unggah foto wajah
+   frontal yang jelas. (Bisa daftarkan beberapa foto untuk orang yang sama.)
+2. Saat **menambah source**, centang **"Pengenalan wajah (face recognition)"**.
+   Aktifkan juga kelas **orang** bila ingin deteksi objek orang sekaligus.
+3. Start source → wajah yang dikenal diberi **label nama** pada video; kemunculan
+   dicatat di tabel **Kemunculan Terdeteksi** (dengan crop + similarity).
+   Wajah tak dikenal diberi label **"unknown"** (default tidak disimpan).
+4. Enrolment baru otomatis dipakai worker dalam ~30 detik tanpa restart.
+
+> ⚠️ Data biometrik bersifat sensitif — gunakan hanya untuk keperluan yang sah
+> dan sesuai regulasi setempat.
 
 ## Troubleshooting
 

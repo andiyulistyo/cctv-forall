@@ -12,12 +12,21 @@ from datetime import datetime, timezone
 
 import cv2
 import numpy as np
+from sqlalchemy import select
 
 from ..config import settings
 from ..database import SessionLocal
-from ..models import VEHICLE_CLASSES, CountEvent, PlateRead, Source
+from ..models import (
+    VEHICLE_CLASSES,
+    CountEvent,
+    EnrolledFace,
+    FaceSighting,
+    PlateRead,
+    Source,
+)
 from .alpr import ALPR
 from .detector import Detector
+from .face import FaceRecognizer, face_bbox
 from .frame_store import SharedState
 from .line_counter import LineCounter
 from .source_reader import SourceReader
@@ -52,7 +61,11 @@ def _update_db_status(source_id: int, status: str, message: str | None = None) -
         db.close()
 
 
-def _draw(frame, detections, counter: LineCounter | None, source_cfg: dict, plates: dict):
+_FACE_KNOWN_COLOR = (255, 200, 0)
+_FACE_UNKNOWN_COLOR = (150, 150, 150)
+
+
+def _draw(frame, detections, counter: LineCounter | None, source_cfg: dict, plates: dict, faces=None):
     # Counting line
     if counter is not None:
         (ax, ay), (bx, by) = counter.line_norm
@@ -82,6 +95,16 @@ def _draw(frame, detections, counter: LineCounter | None, source_cfg: dict, plat
             cv2.putText(frame, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(frame, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
             y += 20
+
+    # Faces
+    for (fx, fy, fw, fh, name, sim) in faces or []:
+        color = _FACE_KNOWN_COLOR if name else _FACE_UNKNOWN_COLOR
+        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), color, 2)
+        label = f"{name} {sim:.2f}" if name else "unknown"
+        cv2.putText(
+            frame, label, (fx, max(12, fy - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA,
+        )
     return frame
 
 
@@ -112,6 +135,23 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
         )
         if not alpr.available:
             alpr = None
+
+    # Optional face recognition
+    fstate: _FaceState | None = None
+    if settings.face_enabled and source_cfg.get("face_enabled", False):
+        rec = FaceRecognizer(
+            settings.yunet_model_path,
+            settings.sface_model_path,
+            det_size=settings.face_det_size,
+        )
+        if rec.available:
+            fstate = _FaceState(
+                rec,
+                threshold=settings.face_similarity_threshold,
+                cooldown=settings.face_sighting_cooldown_sec,
+                log_unknown=settings.face_log_unknown,
+            )
+            fstate.reload_gallery()
 
     # Line counter (only if a line is configured)
     counter: LineCounter | None = None
@@ -172,10 +212,15 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
             if alpr is not None:
                 _run_alpr(alpr, frame, detections, plates_by_track, alpr_attempts, source_id)
 
+            # Face recognition
+            current_faces = _run_faces(fstate, frame, source_id) if fstate is not None else []
+
             # Annotate + publish (rate limited)
             now = time.time()
             if now - last_publish >= publish_interval:
-                annotated = _draw(frame.copy(), detections, counter, source_cfg, plates_by_track)
+                annotated = _draw(
+                    frame.copy(), detections, counter, source_cfg, plates_by_track, current_faces
+                )
                 ok, buf = cv2.imencode(".jpg", annotated, encode_params)
                 if ok:
                     shared.set_frame(source_id, buf.tobytes())
@@ -256,6 +301,99 @@ def _persist_plate(source_id, track_id, vehicle_class, text, conf, plate_img: np
                 vehicle_class=vehicle_class,
                 plate_text=text,
                 confidence=conf,
+                image_path=image_path,
+                timestamp=_now(),
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ----------------------- Face recognition -----------------------
+_GALLERY_RELOAD_SEC = 30.0
+
+
+class _FaceState:
+    """Holds the recognizer, the enrolled gallery, and per-identity logging
+    cooldowns for one running source."""
+
+    def __init__(self, recognizer: FaceRecognizer, threshold: float, cooldown: int, log_unknown: bool):
+        self.rec = recognizer
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.log_unknown = log_unknown
+        self.gallery: np.ndarray | None = None
+        self.names: list[str] = []
+        self.last_reload = 0.0
+        self.last_logged: dict[str, float] = {}
+
+    def reload_gallery(self) -> None:
+        db = SessionLocal()
+        try:
+            rows = db.scalars(select(EnrolledFace)).all()
+            embs, names = [], []
+            for r in rows:
+                if r.embedding:
+                    embs.append(np.asarray(r.embedding, dtype=np.float32))
+                    names.append(r.name)
+            self.gallery = np.stack(embs) if embs else None
+            self.names = names
+        except Exception:
+            pass
+        finally:
+            db.close()
+        self.last_reload = time.time()
+
+
+def _run_faces(fstate: "_FaceState", frame, source_id: int) -> list:
+    # Periodically pick up newly enrolled faces without restarting the worker.
+    if time.time() - fstate.last_reload > _GALLERY_RELOAD_SEC:
+        fstate.reload_gallery()
+
+    results = []
+    for face in fstate.rec.detect(frame):
+        emb = fstate.rec.embed(frame, face)
+        if emb is None:
+            continue
+        name, sim = FaceRecognizer.match(emb, fstate.gallery, fstate.names, fstate.threshold)
+        x, y, w, h = face_bbox(face)
+        results.append((x, y, w, h, name, sim))
+
+        # Log a sighting, throttled per identity (and optionally for unknowns).
+        if name is None and not fstate.log_unknown:
+            continue
+        key = name or "__unknown__"
+        now = time.time()
+        if now - fstate.last_logged.get(key, 0.0) >= fstate.cooldown:
+            fstate.last_logged[key] = now
+            crop = frame[max(0, y): y + h, max(0, x): x + w]
+            _persist_sighting(source_id, name, sim, crop)
+    return results
+
+
+def _persist_sighting(source_id: int, name: str | None, similarity: float, crop: np.ndarray) -> None:
+    image_path = None
+    try:
+        ts = _now().strftime("%Y%m%d_%H%M%S_%f")
+        label = name or "unknown"
+        safe = "".join(c for c in label if c.isalnum() or c in ("-", "_")) or "unknown"
+        fpath = settings.faces_dir / f"sight_{source_id}_{safe}_{ts}.jpg"
+        if crop.size:
+            cv2.imwrite(str(fpath), crop)
+            image_path = str(fpath.relative_to(settings.data_dir))
+    except Exception:
+        image_path = None
+
+    db = SessionLocal()
+    try:
+        db.add(
+            FaceSighting(
+                source_id=source_id,
+                name=name,
+                similarity=float(similarity),
                 image_path=image_path,
                 timestamp=_now(),
             )

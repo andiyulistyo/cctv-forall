@@ -16,7 +16,7 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS backend
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3-pip python3.11-dev \
-    ffmpeg libglib2.0-0 libgomp1 \
+    ffmpeg libglib2.0-0 libgomp1 curl \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
@@ -28,14 +28,20 @@ WORKDIR /app/backend
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /app/weights && cd /app/weights \
+RUN mkdir -p /app/weights/face && cd /app/weights \
     && python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')" \
-    && python -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
+    && python -c "import easyocr; easyocr.Reader(['en'], gpu=False)" \
+    && curl -sSL -o /app/weights/face/yunet.onnx \
+       "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" \
+    && curl -sSL -o /app/weights/face/sface.onnx \
+       "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
 COPY backend/ /app/backend/
 COPY --from=frontend /frontend/dist /app/frontend/dist
 
 ENV YOLO_MODEL=/app/weights/yolo11n.pt \
+    YUNET_MODEL=/app/weights/face/yunet.onnx \
+    SFACE_MODEL=/app/weights/face/sface.onnx \
     DATA_DIR=/app/data \
     DEVICE=cuda \
     PYTHONUNBUFFERED=1

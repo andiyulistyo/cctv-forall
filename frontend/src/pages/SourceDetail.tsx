@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api, CountsResponse, Plate, Source } from "../api";
+import { api, CountsResponse, Plate, Sighting, Source } from "../api";
 import { StatusBadge } from "../components/common";
 import LineDrawCanvas from "../components/LineDrawCanvas";
 
@@ -12,6 +12,7 @@ export default function SourceDetail() {
   const [source, setSource] = useState<Source | null>(null);
   const [counts, setCounts] = useState<CountsResponse | null>(null);
   const [plates, setPlates] = useState<Plate[]>([]);
+  const [sightings, setSightings] = useState<Sighting[]>([]);
   const [tab, setTab] = useState<Tab>("live");
 
   const loadSource = async () => setSource(await api.getSource(sourceId));
@@ -25,6 +26,7 @@ export default function SourceDetail() {
       try {
         setCounts(await api.getCounts(sourceId));
         setPlates(await api.listPlates(sourceId, 20));
+        setSightings(await api.listSightings(sourceId, 20));
         setSource(await api.getSource(sourceId));
       } catch {
         /* ignore transient */
@@ -158,6 +160,40 @@ export default function SourceDetail() {
               </ul>
             )}
           </section>
+
+          {source.face_enabled && (
+            <section className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+              <h2 className="mb-3 font-medium">Wajah Terdeteksi</h2>
+              {sightings.length === 0 ? (
+                <p className="text-sm text-slate-500">Belum ada wajah terdeteksi.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {sightings.map((s) => (
+                    <li key={s.id} className="flex items-center gap-3 text-sm">
+                      {s.has_image && (
+                        <img
+                          src={api.sightingImageUrl(s.id)}
+                          alt={s.name ?? "unknown"}
+                          className="h-10 w-10 rounded border border-slate-700 object-cover"
+                        />
+                      )}
+                      <span className="font-medium">
+                        {s.name ?? <span className="text-slate-500">unknown</span>}
+                      </span>
+                      {s.name && (
+                        <span className="text-xs text-slate-500">
+                          {(s.similarity * 100).toFixed(0)}%
+                        </span>
+                      )}
+                      <span className="ml-auto text-xs text-slate-500">
+                        {new Date(s.timestamp).toLocaleTimeString()}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
         </div>
       </div>
     </div>

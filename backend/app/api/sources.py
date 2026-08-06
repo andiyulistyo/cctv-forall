@@ -33,6 +33,7 @@ def build_source_cfg(src: Source) -> dict:
         "line": src.line,
         "direction_labels": src.direction_labels or {"in": "in", "out": "out"},
         "alpr_enabled": bool(src.alpr_enabled),
+        "face_enabled": bool(src.face_enabled),
     }
 
 
@@ -67,6 +68,7 @@ def create_source(payload: SourceCreate, db: Session = Depends(get_db)) -> Sourc
         url=payload.url,
         enabled_classes=payload.enabled_classes,
         alpr_enabled=1 if payload.alpr_enabled else 0,
+        face_enabled=1 if payload.face_enabled else 0,
         status="stopped",
     )
     db.add(src)
@@ -101,6 +103,8 @@ def update_source(source_id: int, payload: SourceUpdate, db: Session = Depends(g
         src.enabled_classes = payload.enabled_classes
     if payload.alpr_enabled is not None:
         src.alpr_enabled = 1 if payload.alpr_enabled else 0
+    if payload.face_enabled is not None:
+        src.face_enabled = 1 if payload.face_enabled else 0
     db.commit()
     db.refresh(src)
     return _to_out(src, get_manager())
