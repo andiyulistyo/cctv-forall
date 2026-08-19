@@ -24,12 +24,18 @@ from ..models import (
     PlateRead,
     Source,
 )
+from ..runtime import apply_worker_threads, threads_per_worker
 from .alpr import ALPR
-from .detector import Detector
+from .detector import Detector, is_non_torch_model, pick_device
 from .face import FaceRecognizer, face_bbox
 from .frame_store import SharedState
 from .line_counter import LineCounter
-from .source_reader import SourceReader
+from .source_reader import (
+    CHUNKED_SOURCE_TYPES,
+    REALTIME_SOURCE_TYPES,
+    BufferedFrameReader,
+    SourceReader,
+)
 
 # Per-class BGR colors for drawing.
 _CLASS_COLORS = {
@@ -40,6 +46,68 @@ _CLASS_COLORS = {
     "bus": (200, 0, 200),
 }
 _LINE_COLOR = (0, 255, 255)
+
+
+# How often a worker asks the GPU backend to release cached memory.
+_GPU_TRIM_INTERVAL_SEC = 120.0
+
+# How often throughput stats are pushed to the API process.
+_STATS_INTERVAL_SEC = 5.0
+
+
+class _Throughput:
+    """Rolling capture / detect / publish rates for one source.
+
+    Published to the shared state so the dashboard (and `GET /sources`) can
+    show where a stream is actually spending its time: a low detect_fps means
+    inference is the limit, a high dropped_fps means decoding outruns
+    processing, and a low capture_fps points at the camera or the network.
+    """
+
+    def __init__(self, shared: SharedState, source_id: int):
+        self.shared = shared
+        self.source_id = source_id
+        self.processed = 0
+        self.detected = 0
+        self.published = 0
+        self._decoded_mark = 0
+        self._dropped_mark = 0
+        self.window_start = time.time()
+
+    def maybe_publish(self, now: float, live_reader=None) -> None:
+        elapsed = now - self.window_start
+        if elapsed < _STATS_INTERVAL_SEC:
+            return
+        stats = {
+            "processed_fps": round(self.processed / elapsed, 1),
+            "detect_fps": round(self.detected / elapsed, 1),
+            "publish_fps": round(self.published / elapsed, 1),
+        }
+        if live_reader is not None:
+            decoded = live_reader.captured
+            dropped = live_reader.dropped
+            stats["capture_fps"] = round((decoded - self._decoded_mark) / elapsed, 1)
+            stats["dropped_fps"] = round((dropped - self._dropped_mark) / elapsed, 1)
+            self._decoded_mark, self._dropped_mark = decoded, dropped
+        else:
+            stats["capture_fps"] = stats["processed_fps"]
+        self.shared.set_stats(self.source_id, stats)
+        self.processed = self.detected = self.published = 0
+        self.window_start = now
+
+
+def _ocr_device(detector_device: str) -> str:
+    """Device for EasyOCR: explicit setting wins, else follow the detector.
+
+    MPS is deliberately not inherited: EasyOCR's recognition network is small,
+    parts of it fall back to the CPU anyway, and sharing the GPU with YOLO
+    tends to slow both down.
+    """
+    if settings.ocr_device:
+        return settings.ocr_device
+    if detector_device in ("cpu", "mps"):
+        return "cpu"
+    return detector_device
 
 
 def _now() -> datetime:
@@ -113,12 +181,23 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
     shared.set_status(source_id, "starting")
     _update_db_status(source_id, "starting")
 
+    # Every source is its own process. Cap the thread pools before touching
+    # OpenCV/torch, otherwise each worker grabs all cores and they thrash.
+    model_path = settings.yolo_model_path
+    accelerated = pick_device(settings.device) != "cpu" or is_non_torch_model(model_path)
+    apply_worker_threads(
+        threads_per_worker(
+            settings.threads_per_worker, settings.expected_streams, gpu=accelerated
+        )
+    )
+
     try:
         detector = Detector(
-            settings.yolo_model,
+            model_path,
             device=settings.device,
             conf=settings.conf_threshold,
             imgsz=settings.inference_imgsz,
+            half=settings.inference_half,
         )
     except Exception as exc:
         shared.set_status(source_id, "error", f"model load failed: {exc}")
@@ -130,7 +209,7 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
     if settings.alpr_enabled and source_cfg.get("alpr_enabled", True):
         alpr = ALPR(
             languages=settings.ocr_languages,
-            use_gpu=(detector.device != "cpu"),
+            device=_ocr_device(detector.device),
             plate_model=settings.plate_model,
         )
         if not alpr.available:
@@ -159,16 +238,51 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
     if line and "a" in line and "b" in line:
         counter = LineCounter(line_norm=(tuple(line["a"]), tuple(line["b"])))
 
-    reader = SourceReader(source_cfg["type"], source_cfg["url"])
+    source_type = source_cfg["type"]
+    reader = SourceReader(
+        source_type,
+        source_cfg["url"],
+        hwaccel=settings.ffmpeg_hwaccel,
+        rtsp_tcp=settings.rtsp_transport_tcp,
+        youtube_max_height=settings.youtube_max_height,
+    )
+    # Decoding always runs in its own thread so the worker never stalls it; how
+    # the frames are handed over depends on how the source delivers them.
+    live_reader: BufferedFrameReader | None = None
+    if source_type in REALTIME_SOURCE_TYPES:
+        # Camera sets the pace: keep only the newest frame.
+        live_reader = BufferedFrameReader(reader, buffer_frames=1, paced=False)
+    elif source_type in CHUNKED_SOURCE_TYPES:
+        # HLS/YouTube arrive a segment at a time: buffer the burst and release
+        # it at the stream's own frame rate. Backpressure is essential here —
+        # an unthrottled decoder thread starves this loop of the GIL.
+        buffer_frames = max(2, int(settings.capture_buffer_seconds * 30))
+        live_reader = BufferedFrameReader(
+            reader, buffer_frames=buffer_frames, paced=True, backpressure=True
+        )
+    frame_source = live_reader or reader
+
     enabled_classes = source_cfg.get("enabled_classes", [])
 
     stride = max(1, settings.frame_stride)
+    process_width = max(0, settings.process_width)
+    last_trim = time.time()
     frame_no = 0
     plates_by_track: dict[int, str] = {}
     alpr_attempts: dict[int, int] = {}
     last_publish = 0.0
-    publish_interval = 1.0 / max(1, settings.mjpeg_fps)
+    # Publish slightly early rather than slightly late: frames only arrive on
+    # the source's own cadence, so a strict ">= interval" test silently halves
+    # the display rate whenever the two don't divide evenly (a 30 fps camera
+    # with MJPEG_FPS=20 ends up publishing 15).
+    publish_interval = 0.9 / max(1, settings.mjpeg_fps)
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, settings.jpeg_quality]
+    # Latest detections/faces, redrawn on every published frame so the video
+    # stays smooth between detections.
+    detections: list = []
+    current_faces: list = []
+    frame_seq = 0
+    stats = _Throughput(shared, source_id)
 
     def stopped() -> bool:
         return stop_event.is_set()
@@ -187,44 +301,87 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
         report("error", message)
 
     try:
-        for frame in reader.frames(stopped, on_error=on_open_error):
+        for frame in frame_source.frames(stopped, on_error=on_open_error):
             # First frame after (re)connecting -> mark running.
             report("running")
 
             frame_no += 1
-            if frame_no % stride != 0:
+            stats.processed += 1
+            now = time.time()
+
+            # Detection is the expensive step and runs every `stride` frames.
+            # Publishing is separate and happens at MJPEG_FPS: the frames in
+            # between are shown with the most recent boxes redrawn on them.
+            # Tying the two together is what made the live view look choppy —
+            # it could never be smoother than the detection rate.
+            run_detection = frame_no % stride == 0
+            should_publish = now - last_publish >= publish_interval
+            if not run_detection and not should_publish:
                 continue
 
-            h, w = frame.shape[:2]
-            detections = detector.track(frame, enabled_classes)
-
-            # Line counting
-            if counter is not None:
-                counter.set_frame_size(w, h)
-                crossings = counter.update(
-                    [(d.track_id, d.class_name, *d.centroid) for d in detections]
+            # Detection, drawing and JPEG encoding all run on a downscaled copy
+            # when process_width is set; ANPR still crops from the full frame so
+            # plate text stays readable. detect_scale converts detection boxes
+            # back to full-frame coordinates.
+            full_frame = frame
+            detect_scale = 1.0
+            if process_width and frame.shape[1] > process_width:
+                new_h = max(1, round(frame.shape[0] * process_width / frame.shape[1]))
+                frame = cv2.resize(
+                    frame, (process_width, new_h), interpolation=cv2.INTER_AREA
                 )
-                if crossings:
-                    _persist_crossings(source_id, crossings)
-                    shared.set_counts(source_id, counter.total())
+                detect_scale = full_frame.shape[1] / float(frame.shape[1])
 
-            # ANPR for vehicles
-            if alpr is not None:
-                _run_alpr(alpr, frame, detections, plates_by_track, alpr_attempts, source_id)
+            h, w = frame.shape[:2]
 
-            # Face recognition
-            current_faces = _run_faces(fstate, frame, source_id) if fstate is not None else []
+            if run_detection:
+                stats.detected += 1
+                detections = detector.track(frame, enabled_classes)
+
+                # Line counting
+                if counter is not None:
+                    counter.set_frame_size(w, h)
+                    crossings = counter.update(
+                        [(d.track_id, d.class_name, *d.centroid) for d in detections]
+                    )
+                    if crossings:
+                        _persist_crossings(source_id, crossings)
+                        shared.set_counts(source_id, counter.total())
+
+                # ANPR for vehicles
+                if alpr is not None:
+                    _run_alpr(
+                        alpr,
+                        full_frame,
+                        detections,
+                        plates_by_track,
+                        alpr_attempts,
+                        source_id,
+                        detect_scale,
+                    )
+
+                # Face recognition
+                current_faces = _run_faces(fstate, frame, source_id) if fstate is not None else []
 
             # Annotate + publish (rate limited)
-            now = time.time()
-            if now - last_publish >= publish_interval:
+            if should_publish:
                 annotated = _draw(
-                    frame.copy(), detections, counter, source_cfg, plates_by_track, current_faces
+                    frame, detections, counter, source_cfg, plates_by_track, current_faces
                 )
                 ok, buf = cv2.imencode(".jpg", annotated, encode_params)
                 if ok:
-                    shared.set_frame(source_id, buf.tobytes())
+                    frame_seq += 1
+                    stats.published += 1
+                    shared.set_frame(source_id, buf.tobytes(), frame_seq)
                 last_publish = now
+
+            stats.maybe_publish(now, live_reader)
+
+            # The MPS caching allocator keeps growing over a long run; trimming
+            # occasionally keeps a multi-stream setup within GPU memory.
+            if now - last_trim >= _GPU_TRIM_INTERVAL_SEC:
+                detector.trim_memory()
+                last_trim = now
 
         shared.set_status(source_id, "stopped")
         _update_db_status(source_id, "stopped")
@@ -253,7 +410,17 @@ def _persist_crossings(source_id: int, crossings) -> None:
         db.close()
 
 
-def _run_alpr(alpr: ALPR, frame, detections, plates_by_track, alpr_attempts, source_id: int) -> None:
+def _run_alpr(
+    alpr: ALPR,
+    frame,
+    detections,
+    plates_by_track,
+    alpr_attempts,
+    source_id: int,
+    scale: float = 1.0,
+) -> None:
+    """Read plates from ``frame`` (full resolution); ``scale`` maps detection
+    boxes from the downscaled detection frame onto it."""
     for det in detections:
         if det.class_name not in VEHICLE_CLASSES:
             continue
@@ -268,8 +435,9 @@ def _run_alpr(alpr: ALPR, frame, detections, plates_by_track, alpr_attempts, sou
         if attempts % 3 != 0:
             continue
 
-        x1, y1 = max(0, int(det.x1)), max(0, int(det.y1))
-        x2, y2 = int(det.x2), int(det.y2)
+        box = det.scaled(scale)
+        x1, y1 = max(0, int(box.x1)), max(0, int(box.y1))
+        x2, y2 = int(box.x2), int(box.y2)
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             continue

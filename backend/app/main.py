@@ -16,6 +16,7 @@ from .database import SessionLocal, init_db
 from .detection.manager import get_manager, init_manager
 from .models import Source
 from .retention import start_scheduler, stop_scheduler
+from . import runtime
 from .api import auth_routes, counts, faces, plates, sources, streams
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
@@ -57,7 +58,30 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "app": settings.app_name}
+    """Liveness plus the runtime facts you need to confirm acceleration is on
+    (device actually selected, hardware decoder, thread budget per worker)."""
+    from .detection.detector import is_non_torch_model, pick_device
+
+    device = pick_device(settings.device)
+    model_path = settings.yolo_model_path
+    accelerated = device != "cpu" or is_non_torch_model(model_path)
+    return {
+        "status": "ok",
+        "app": settings.app_name,
+        "detection": {
+            "model": model_path,
+            "device": "coreml" if is_non_torch_model(model_path) else device,
+            "imgsz": settings.inference_imgsz,
+            "half": settings.inference_half and device != "cpu",
+            "frame_stride": settings.frame_stride,
+            "process_width": settings.process_width or None,
+            "threads_per_worker": runtime.threads_per_worker(
+                settings.threads_per_worker, settings.expected_streams, gpu=accelerated
+            ),
+            "ffmpeg_hwaccel": settings.ffmpeg_hwaccel or None,
+        },
+        "hardware": runtime.describe(),
+    }
 
 
 app.include_router(auth_routes.router)

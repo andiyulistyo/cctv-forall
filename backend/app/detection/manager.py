@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import threading
 
 from .frame_store import SharedState
 from .worker import run_worker
+
+# Set when the app is shutting down. MJPEG responses are endless generators;
+# without this they keep yielding and uvicorn waits forever for the "in-flight"
+# response to finish, so Ctrl-C appears to hang.
+SHUTTING_DOWN = threading.Event()
 
 
 class DetectionManager:
@@ -66,6 +72,7 @@ class DetectionManager:
         return self.shared.get_counts(source_id)
 
     def shutdown(self) -> None:
+        SHUTTING_DOWN.set()
         for source_id in list(self._procs.keys()):
             self.stop(source_id, timeout=4.0)
         try:

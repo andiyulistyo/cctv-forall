@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 
 from ..auth import validate_token
 from ..config import settings
-from ..detection.manager import get_manager
+from ..detection.manager import SHUTTING_DOWN, get_manager
 
 router = APIRouter(prefix="/streams", tags=["streams"])
 
@@ -35,21 +35,44 @@ def _placeholder_jpeg() -> bytes:
     return _PLACEHOLDER
 
 
+# Re-send the current frame at least this often, so a paused source still
+# looks like a live connection to the browser and to any proxy in between.
+_KEEPALIVE_SEC = 2.0
+
+
 @router.get("/{source_id}")
 def stream(source_id: int, token: str = Query(...)):
     validate_token(token)
     mgr = get_manager()
     interval = 1.0 / max(1, settings.mjpeg_fps)
+    # Poll finer than the frame interval so a new frame goes out as soon as it
+    # exists instead of waiting for the next tick — sampling on a fixed timer
+    # that is not aligned with the worker is what makes an otherwise steady
+    # stream look jerky.
+    poll = max(0.005, interval / 4)
 
     def generate():
-        while True:
-            frame = mgr.get_frame(source_id)
+        last_seq = -1
+        last_sent = 0.0
+        while not SHUTTING_DOWN.is_set():
+            # Cheap integer read; the JPEG itself (tens of KB, transferred over
+            # the manager socket) is only pulled when it has actually changed.
+            seq = mgr.shared.get_frame_seq(source_id)
+            now = time.time()
+            if seq == last_seq and now - last_sent < _KEEPALIVE_SEC:
+                time.sleep(poll)
+                continue
+
+            frame = mgr.get_frame(source_id) if seq else None
             if frame is None:
                 frame = _placeholder_jpeg()
+            last_seq, last_sent = seq, now
             yield (
                 b"--" + _BOUNDARY.encode() + b"\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
+            # Never exceed the configured frame rate, however fast the worker
+            # publishes.
             time.sleep(interval)
 
     return StreamingResponse(

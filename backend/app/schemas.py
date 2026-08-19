@@ -80,6 +80,9 @@ class SourceOut(SourceBase):
     status: str
     status_message: str | None = None
     created_at: datetime
+    # Live throughput of the worker (capture/detect/publish fps), None unless
+    # the source is running. Diagnostic only — see _Throughput in worker.py.
+    stats: dict | None = None
 
     model_config = {"from_attributes": True}
 

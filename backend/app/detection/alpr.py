@@ -32,15 +32,27 @@ def looks_like_plate(normalized: str) -> bool:
 
 
 class ALPR:
-    def __init__(self, languages: str = "en", use_gpu: bool = False, plate_model: str = ""):
+    def __init__(self, languages: str = "en", device: str = "cpu", plate_model: str = ""):
         self._reader = None
         self._plate_detector = None
         self._available = False
+        self.device = device or "cpu"
         try:
             import easyocr
 
             langs = [s.strip() for s in languages.split(",") if s.strip()] or ["en"]
-            self._reader = easyocr.Reader(langs, gpu=use_gpu, verbose=False)
+            # EasyOCR accepts gpu=False, gpu=True or an explicit device string.
+            # Passing the string keeps us in control (e.g. "mps" on Apple
+            # Silicon) instead of relying on its own auto-detection.
+            gpu_arg = False if self.device == "cpu" else self.device
+            try:
+                self._reader = easyocr.Reader(langs, gpu=gpu_arg, verbose=False)
+            except Exception as exc:
+                # Some EasyOCR builds choke on non-CUDA accelerators; the CPU
+                # path always works and OCR is only run on small plate crops.
+                print(f"[ALPR] {self.device} unavailable ({exc}); falling back to CPU")
+                self.device = "cpu"
+                self._reader = easyocr.Reader(langs, gpu=False, verbose=False)
             self._available = True
         except Exception as exc:  # pragma: no cover - environment dependent
             print(f"[ALPR] disabled: could not init EasyOCR: {exc}")

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api, CountsResponse, Plate, Sighting, Source } from "../api";
+import { api, CountsResponse, Plate, Sighting, Source, SourceStats } from "../api";
 import { StatusBadge } from "../components/common";
 import LineDrawCanvas from "../components/LineDrawCanvas";
 
@@ -90,14 +90,17 @@ export default function SourceDetail() {
           </div>
 
           {tab === "live" ? (
-            <div className="overflow-hidden rounded-lg border border-slate-700 bg-black">
-              {running ? (
-                <img src={api.streamUrl(sourceId)} alt="live" className="w-full" />
-              ) : (
-                <div className="flex aspect-video items-center justify-center text-slate-500">
-                  Source tidak berjalan. Klik Start untuk melihat live.
-                </div>
-              )}
+            <div>
+              <div className="overflow-hidden rounded-lg border border-slate-700 bg-black">
+                {running ? (
+                  <img src={api.streamUrl(sourceId)} alt="live" className="w-full" />
+                ) : (
+                  <div className="flex aspect-video items-center justify-center text-slate-500">
+                    Source tidak berjalan. Klik Start untuk melihat live.
+                  </div>
+                )}
+              </div>
+              {running && source.stats ? <StreamStats stats={source.stats} /> : null}
             </div>
           ) : (
             <LineDrawCanvas source={source} onSaved={loadSource} />
@@ -196,6 +199,36 @@ export default function SourceDetail() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/** Throughput readout: makes it obvious whether a choppy live view comes from
+ *  the source (low capture) or from our own pipeline (low detect/publish). */
+function StreamStats({ stats }: { stats: SourceStats }) {
+  const items: [string, number | undefined, string][] = [
+    ["masuk", stats.capture_fps, "frame per detik yang diterima dari sumber"],
+    ["deteksi", stats.detect_fps, "frame per detik yang dianalisis YOLO"],
+    ["tampil", stats.publish_fps, "frame per detik yang dikirim ke browser"],
+    ["dibuang", stats.dropped_fps, "frame dibuang karena tidak terkejar"],
+  ];
+  const slowSource =
+    stats.capture_fps !== undefined && stats.capture_fps < 5;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
+      {items.map(([label, value, title]) =>
+        value === undefined ? null : (
+          <span key={label} title={title}>
+            {label}: <span className="font-mono text-slate-200">{value.toFixed(1)}</span> fps
+          </span>
+        )
+      )}
+      {slowSource ? (
+        <span className="text-amber-400">
+          sumber lambat — video tersendat dari sisi kamera/jaringan, bukan dari server
+        </span>
+      ) : null}
     </div>
   );
 }

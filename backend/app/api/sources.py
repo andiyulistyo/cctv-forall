@@ -44,6 +44,7 @@ def _to_out(src: Source, mgr) -> SourceOut:
         st = mgr.shared.get_status(src.id)
         if st:
             out.status, out.status_message = st[0], st[1]
+        out.stats = mgr.shared.get_stats(src.id)
     return out
 
 

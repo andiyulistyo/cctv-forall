@@ -19,6 +19,16 @@ export interface Source {
   status: string;
   status_message: string | null;
   created_at: string;
+  stats: SourceStats | null;
+}
+
+/** Live throughput of a running worker, for diagnosing a choppy stream. */
+export interface SourceStats {
+  capture_fps?: number;   // frames arriving from the camera/stream
+  processed_fps?: number; // frames the worker got to look at
+  detect_fps?: number;    // frames that ran through YOLO
+  publish_fps?: number;   // frames sent to the browser
+  dropped_fps?: number;   // frames discarded because we were behind
 }
 
 export interface SourceListResponse {
