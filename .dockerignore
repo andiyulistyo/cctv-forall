@@ -4,7 +4,8 @@ frontend/node_modules/
 frontend/dist/
 data/
 .git/
-.venv/
+**/.venv/
+**/venv/
 *.db
 *.db-wal
 *.db-shm

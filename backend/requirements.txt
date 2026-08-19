@@ -18,10 +18,20 @@ APScheduler==3.11.0
 # --- Computer vision / detection ---
 # NOTE: torch is installed separately in the Dockerfile so we can pick the
 # correct CPU vs CUDA wheel. It is intentionally NOT pinned here.
-ultralytics==8.3.63
+# >=8.3.150: earlier releases pin numpy<2 on macOS, which cannot resolve on
+# Python 3.12/3.13 (no numpy 1.x wheels) and blocks Apple Silicon installs.
+ultralytics==8.3.200
 opencv-python-headless==4.11.0.86
+# ultralytics depends on the non-headless opencv-python; pin it to the same
+# version so the two distributions don't install mismatched cv2 modules over
+# each other (an unpinned resolve now picks up OpenCV 5.x).
+opencv-python==4.11.0.86
 numpy==2.1.3
 Pillow==11.1.0
+# ByteTrack's assignment step. Ultralytics imports it lazily and would
+# pip-install it at runtime (inside the worker process) if missing, which fails
+# on machines without a compiler and stalls the first stream.
+lap==0.5.12
 
 # --- Source input ---
 # Unpinned on purpose: YouTube changes frequently and only recent yt-dlp

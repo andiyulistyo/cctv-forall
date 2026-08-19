@@ -13,7 +13,7 @@ FROM python:3.11-slim AS backend
 
 # System deps: ffmpeg for OpenCV stream decoding; libs for OpenCV/torch runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libglib2.0-0 libgomp1 curl \
+    ffmpeg libglib2.0-0 libgl1 libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # CPU build of torch/torchvision (kept out of requirements.txt on purpose).

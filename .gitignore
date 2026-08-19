@@ -15,5 +15,8 @@ frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo
 
-# Env
+# Env — backups too, they hold the same secrets
 .env
+.env.*
+!.env.example
+!.env.macos.example
