@@ -20,3 +20,13 @@ frontend/dist/
 .env.*
 !.env.example
 !.env.macos.example
+!.env.amd.example
+!.env.intel.example
+
+# Editor leftovers. ".env~" and "..env.un~" match none of the patterns above,
+# so without these an editor backup of .env is left staged and ready to commit.
+*~
+.*.un~
+*.swp
+*.bak
+*.orig

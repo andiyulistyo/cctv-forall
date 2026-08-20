@@ -20,15 +20,28 @@ class DetectionManager:
         self._ctx = mp.get_context("spawn")
         self._manager = self._ctx.Manager()
         self.shared = SharedState(self._manager)
-        # source_id -> (Process, stop Event)
+        # source_id -> (Process, stop Event, slot)
         self._procs: dict[int, tuple] = {}
+
+    def _next_slot(self) -> int:
+        """Smallest free worker index.
+
+        Workers use it to claim their own slice of the CPU, so it has to be
+        dense and stable for as long as a worker lives -- reusing the index of
+        a stopped worker is exactly right, a monotonic counter is not.
+        """
+        taken = {entry[2] for entry in self._procs.values()}
+        slot = 0
+        while slot in taken:
+            slot += 1
+        return slot
 
     def is_running(self, source_id: int) -> bool:
         entry = self._procs.get(source_id)
         return bool(entry and entry[0].is_alive())
 
     def running_ids(self) -> list[int]:
-        return [sid for sid, (proc, _e) in self._procs.items() if proc.is_alive()]
+        return [sid for sid, entry in self._procs.items() if entry[0].is_alive()]
 
     def start(self, source_cfg: dict) -> None:
         source_id = source_cfg["id"]
@@ -38,20 +51,21 @@ class DetectionManager:
         self._reap(source_id)
 
         stop_event = self._ctx.Event()
+        slot = self._next_slot()
         proc = self._ctx.Process(
             target=run_worker,
-            args=(source_cfg, self.shared, stop_event),
+            args=(source_cfg, self.shared, stop_event, slot),
             name=f"worker-{source_id}",
             daemon=True,
         )
         proc.start()
-        self._procs[source_id] = (proc, stop_event)
+        self._procs[source_id] = (proc, stop_event, slot)
 
     def stop(self, source_id: int, timeout: float = 8.0) -> None:
         entry = self._procs.get(source_id)
         if not entry:
             return
-        proc, stop_event = entry
+        proc, stop_event = entry[0], entry[1]
         stop_event.set()
         proc.join(timeout)
         if proc.is_alive():

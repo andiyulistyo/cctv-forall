@@ -1,0 +1,18 @@
+# Optional: Intel OpenVINO runtime.
+#
+# Install on x86 machines without an NVIDIA GPU -- it is the fast inference
+# path for both an Intel iGPU (GPU plugin) and an AMD Ryzen CPU (the CPU plugin
+# is vendor-neutral and uses AVX-512/VNNI on Zen 4).
+#
+#   pip install -r backend/requirements-openvino.txt
+#
+# Deliberately kept out of requirements.txt: the Docker CPU image and the
+# Apple Silicon install have no use for it.
+#
+# >=2024.4 is the first release ultralytics targets with check_requirements();
+# it also still supports Intel Gen9 iGPUs (Skylake/Kaby Lake HD Graphics).
+openvino>=2024.4
+
+# Only needed to *export* an INT8 model (scripts/export_openvino.py --int8).
+# Running an already-quantized IR needs openvino alone.
+nncf>=2.12

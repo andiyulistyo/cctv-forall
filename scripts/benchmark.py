@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """Measure detection throughput for the current machine.
 
-Runs the same YOLO model on CPU, on the Apple GPU (MPS) and — if a CoreML
-bundle exists next to the weights — on the Neural Engine, so you can pick
-YOLO_MODEL / DEVICE / INFERENCE_IMGSZ with numbers instead of guesses.
+Runs the same model on every backend this machine can actually use — torch on
+CPU/CUDA/MPS, the Apple Neural Engine via a CoreML bundle, the Intel iGPU or
+the OpenVINO CPU plugin via an OpenVINO IR — so you can pick YOLO_MODEL /
+DEVICE / INFERENCE_IMGSZ with numbers instead of guesses.
 
     cd backend && .venv/bin/python ../scripts/benchmark.py
+    .venv/Scripts/python ../scripts/benchmark.py --model ../data/weights/yolo11n_openvino_model
     .venv/bin/python ../scripts/benchmark.py --model yolo11s.pt --imgsz 640 --frames 60
 """
 from __future__ import annotations
@@ -20,7 +22,14 @@ sys.path.insert(0, str(BACKEND))
 
 import numpy as np  # noqa: E402
 
-from app.runtime import chip_name, describe, performance_cores  # noqa: E402
+from app.runtime import (  # noqa: E402
+    chip_name,
+    describe,
+    has_intel_gpu,
+    has_mps,
+    openvino_devices,
+    physical_cores,
+)
 
 
 def bench(model_path: str, device: str, imgsz: int, half: bool, frames: int, size) -> float | None:
@@ -29,7 +38,7 @@ def bench(model_path: str, device: str, imgsz: int, half: bool, frames: int, siz
     try:
         det = Detector(model_path, device=device, conf=0.35, imgsz=imgsz, half=half)
     except Exception as exc:
-        print(f"  ! could not load on {device}: {exc}")
+        print(f"  ! could not load on {device or 'auto'}: {exc}")
         return None
 
     rng = np.random.default_rng(0)
@@ -47,39 +56,74 @@ def bench(model_path: str, device: str, imgsz: int, half: bool, frames: int, siz
     return frames / elapsed
 
 
+def auto_devices(model_path: str) -> list[str]:
+    """Devices worth trying for this model on this machine.
+
+    An OpenVINO IR only ever runs on OpenVINO devices, a CoreML bundle only on
+    the Apple runtime; torch weights can go to whatever torch found.
+    """
+    from app.detection.detector import is_non_torch_model, is_openvino_model
+
+    if is_openvino_model(model_path):
+        devices = ["intel:cpu"]
+        if has_intel_gpu():
+            devices.append("intel:gpu")
+        return devices
+    if is_non_torch_model(model_path):
+        return [""]  # the bundle picks its own runtime
+    devices = ["cpu"]
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            devices.append("cuda")
+    except Exception:
+        pass
+    if has_mps():
+        devices.append("mps")
+    return devices
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="yolo11n.pt", help="weights or .mlpackage")
+    ap.add_argument("--model", default="yolo11n.pt", help="weights, .mlpackage or _openvino_model/")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--frames", type=int, default=60)
     ap.add_argument("--width", type=int, default=1920, help="synthetic frame width")
     ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--devices", default="cpu,mps", help="comma separated")
+    ap.add_argument(
+        "--devices",
+        default="auto",
+        help="comma separated, or 'auto' to test everything this machine supports",
+    )
     ap.add_argument("--half", action="store_true", help="also test fp16 on GPU devices")
     args = ap.parse_args()
 
     info = describe()
-    print(f"{chip_name()} — {info['cpu_cores']} cores ({performance_cores()} performance)")
-    print(f"torch {info.get('torch')}  mps={info.get('mps_available')}  cuda={info.get('cuda_available')}")
+    print(f"{chip_name()} — {info['cpu_cores']} logical / {physical_cores()} physical cores")
+    print(
+        f"torch {info.get('torch')}  mps={info.get('mps_available')}  "
+        f"cuda={info.get('cuda_available')}  "
+        f"openvino={info.get('openvino')} {list(openvino_devices())}"
+    )
     print(f"model={args.model} imgsz={args.imgsz} input={args.width}x{args.height}\n")
 
-    from app.detection.detector import is_non_torch_model
+    if args.devices.strip().lower() == "auto":
+        devices = auto_devices(args.model)
+    else:
+        devices = [d.strip() for d in args.devices.split(",") if d.strip()]
 
     size = (args.width, args.height)
     runs: list[tuple[str, bool]] = []
-    if is_non_torch_model(args.model):
-        # CoreML/ONNX bundles carry their own runtime; the device flag is moot.
-        runs.append(("coreml", False))
-    else:
-        for d in [d.strip() for d in args.devices.split(",") if d.strip()]:
-            runs.append((d, False))
-            if args.half and d != "cpu":
-                runs.append((d, True))
+    for d in devices:
+        runs.append((d, False))
+        # fp16 only means something on a torch GPU device.
+        if args.half and d in ("cuda", "mps"):
+            runs.append((d, True))
 
     results: dict[str, float] = {}
     for device, half in runs:
-        label = f"{device}{' fp16' if half else ''}"
-        device = "" if device == "coreml" else device
+        label = f"{device or 'auto'}{' fp16' if half else ''}"
         print(f"[{label}] running {args.frames} frames...")
         fps = bench(args.model, device, args.imgsz, half, args.frames, size)
         if fps:

@@ -1,13 +1,15 @@
 """Hardware detection and per-process runtime tuning.
 
-Kept free of heavy imports (no cv2 / torch at module level) so it can be used
-very early in a worker process, before those libraries are configured.
+Kept free of heavy imports (no cv2 / torch / openvino at module level) so it
+can be used very early in a worker process, before those libraries are
+configured.
 
 The main consumer is the detection worker: every source runs in its own
 process, so without an explicit thread budget OpenCV and torch each spin up
 one thread per core *per worker*. On a machine like the Mac mini M4 Pro
 (8 performance + 4 efficiency cores) four streams would fight over ~48 threads
-and lose more time to context switching than to actual inference.
+and lose more time to context switching than to actual inference. The same
+applies to a Ryzen 7840U (8 cores / 16 threads) on Windows.
 """
 from __future__ import annotations
 
@@ -20,6 +22,14 @@ from functools import lru_cache
 
 def is_macos() -> bool:
     return sys.platform == "darwin"
+
+
+def is_windows() -> bool:
+    return sys.platform == "win32"
+
+
+def is_linux() -> bool:
+    return sys.platform.startswith("linux")
 
 
 def is_apple_silicon() -> bool:
@@ -42,17 +52,42 @@ def _sysctl_int(key: str) -> int | None:
 
 
 @lru_cache(maxsize=None)
-def performance_cores() -> int:
-    """Number of performance ("P") cores, falling back to total cores.
+def _psutil_physical_cores() -> int | None:
+    """Physical (non-SMT) core count, or None when psutil is unavailable.
+
+    psutil comes along with ultralytics, so this costs no extra dependency.
+    It matters because ``os.cpu_count()`` reports *logical* CPUs: budgeting 16
+    threads on an 8-core Ryzen just makes the SMT siblings fight each other.
+    """
+    try:
+        import psutil
+
+        cores = psutil.cpu_count(logical=False)
+        return int(cores) if cores else None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=None)
+def physical_cores() -> int:
+    """Cores worth scheduling detection work on.
 
     Apple Silicon exposes core clusters via ``hw.perflevel0`` (performance) and
     ``hw.perflevel1`` (efficiency). Scheduling detection work as if the E-cores
     were full-speed cores just adds contention, so we budget on P-cores only.
+    Elsewhere we budget on physical cores and ignore SMT siblings.
     """
     cores = _sysctl_int("hw.perflevel0.logicalcpu")
     if cores:
         return cores
+    cores = _psutil_physical_cores()
+    if cores:
+        return cores
     return os.cpu_count() or 4
+
+
+# Historic name, still used by scripts/benchmark.py and the tests.
+performance_cores = physical_cores
 
 
 @lru_cache(maxsize=None)
@@ -69,7 +104,41 @@ def chip_name() -> str:
                 return out.stdout.strip()
         except Exception:
             pass
+    if is_windows():
+        # platform.processor() on Windows returns the family/model string
+        # ("AMD64 Family 25 Model 116 ..."), not the marketing name we want in
+        # the health payload and in the setup script.
+        try:
+            out = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except Exception:
+            pass
     return platform.processor() or platform.machine()
+
+
+def cpu_vendor() -> str:
+    """One of ``apple`` / ``amd`` / ``intel`` / ``unknown``.
+
+    Used to pick a starting profile in the setup script and to report what the
+    app thinks it is running on.
+    """
+    if is_apple_silicon():
+        return "apple"
+    name = f"{chip_name()} {platform.processor()}".lower()
+    if "amd" in name or "ryzen" in name:
+        return "amd"
+    if "intel" in name or "core(tm)" in name:
+        return "intel"
+    return "unknown"
 
 
 def has_mps() -> bool:
@@ -84,21 +153,56 @@ def has_mps() -> bool:
         return False
 
 
+@lru_cache(maxsize=None)
+def openvino_devices() -> tuple[str, ...]:
+    """OpenVINO devices present on this machine, e.g. ``("CPU", "GPU")``.
+
+    Empty when the openvino package is not installed (it is optional -- see
+    backend/requirements-openvino.txt).
+    """
+    try:
+        import openvino as ov
+
+        return tuple(ov.Core().available_devices)
+    except Exception:
+        return ()
+
+
+def has_intel_gpu() -> bool:
+    """True when OpenVINO can target an Intel iGPU/dGPU.
+
+    Intel-only by construction: the OpenVINO GPU plugin does not support AMD
+    Radeon, so a Ryzen machine reports False and runs on the CPU plugin.
+    """
+    return any(d == "GPU" or d.startswith("GPU.") for d in openvino_devices())
+
+
+@lru_cache(maxsize=None)
+def openvino_version() -> str | None:
+    try:
+        import openvino as ov
+
+        return str(ov.__version__)
+    except Exception:
+        return None
+
+
 def threads_per_worker(configured: int, expected_streams: int, gpu: bool) -> int:
     """Resolve the CPU thread budget for a single detection worker.
 
-    ``configured`` > 0 wins. Otherwise the P-cores are split across the number
-    of streams the operator expects to run, leaving headroom for the API
-    process and for video decoding. When inference runs on the GPU (MPS/CUDA)
-    the CPU only does pre/post-processing, so a small budget is plenty.
+    ``configured`` > 0 wins. Otherwise the cores are split across the number of
+    streams the operator expects to run, leaving headroom for the API process
+    and for video decoding. When inference runs on an accelerator (MPS, CUDA,
+    CoreML, OpenVINO GPU) the CPU only does pre/post-processing, so a small
+    budget is plenty.
     """
     if configured > 0:
         return configured
-    cores = performance_cores()
+    cores = physical_cores()
     streams = max(1, expected_streams)
     budget = max(1, cores // streams)
     if gpu:
-        # GPU does the matmuls; more CPU threads only add contention.
+        # The accelerator does the matmuls; more CPU threads only add contention.
         budget = min(budget, 2)
     return max(1, min(budget, cores))
 
@@ -128,15 +232,71 @@ def apply_worker_threads(n_threads: int) -> None:
         pass
 
 
+def cpu_affinity_slice(slot: int, n_threads: int) -> list[int] | None:
+    """Logical CPUs worker ``slot`` should be restricted to, or None.
+
+    The ids are laid out so consecutive workers land on different physical
+    cores, taking every SMT sibling of a core along with it.
+    """
+    logical = os.cpu_count() or 1
+    cores = physical_cores()
+    if cores <= 1 or n_threads <= 0:
+        return None
+    threads_per_core = max(1, logical // max(1, cores))
+    total_slots = max(1, cores // n_threads)
+    if total_slots <= 1:
+        return None  # a single worker may as well have the whole machine
+    first_core = (slot % total_slots) * n_threads
+    picked: list[int] = []
+    for core in range(first_core, min(first_core + n_threads, cores)):
+        for sibling in range(threads_per_core):
+            cpu = core * threads_per_core + sibling
+            if cpu < logical:
+                picked.append(cpu)
+    return picked or None
+
+
+def pin_worker_affinity(slot: int, n_threads: int, mode: str = "auto") -> list[int] | None:
+    """Restrict this process to its own slice of the CPU.
+
+    ``apply_worker_threads`` is not enough for every backend: the OpenVINO CPU
+    plugin schedules on TBB and ignores ``OMP_NUM_THREADS``, so without this
+    every worker spins up one thread per logical CPU. TBB *does* honour the
+    process affinity mask, and so do OpenMP and torch, which makes this the one
+    lever that works for all of them.
+
+    Returns the CPU list that was applied, or None when nothing changed.
+    """
+    if mode == "off" or is_macos():
+        # macOS has no per-process affinity API (and its scheduler moves work
+        # between P and E cores on purpose).
+        return None
+    cpus = cpu_affinity_slice(slot, n_threads)
+    if not cpus:
+        return None
+    try:
+        import psutil
+
+        psutil.Process().cpu_affinity(cpus)
+        return cpus
+    except Exception:
+        return None
+
+
 def describe() -> dict:
     """Small summary used by the /api/health endpoint."""
     info = {
         "platform": sys.platform,
         "machine": platform.machine(),
         "cpu": chip_name(),
+        "vendor": cpu_vendor(),
         "cpu_cores": os.cpu_count(),
-        "performance_cores": performance_cores(),
+        "physical_cores": physical_cores(),
+        # Kept under the old name too: the Apple Silicon docs refer to it.
+        "performance_cores": physical_cores(),
         "apple_silicon": is_apple_silicon(),
+        "openvino": openvino_version(),
+        "openvino_devices": list(openvino_devices()),
     }
     try:
         import torch

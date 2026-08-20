@@ -60,23 +60,25 @@ app.add_middleware(
 def health():
     """Liveness plus the runtime facts you need to confirm acceleration is on
     (device actually selected, hardware decoder, thread budget per worker)."""
-    from .detection.detector import is_non_torch_model, pick_device
+    from .detection.detector import plan_inference
 
-    device = pick_device(settings.device)
     model_path = settings.yolo_model_path
-    accelerated = device != "cpu" or is_non_torch_model(model_path)
+    plan = plan_inference(model_path, settings.device, settings.inference_half)
     return {
         "status": "ok",
         "app": settings.app_name,
         "detection": {
             "model": model_path,
-            "device": "coreml" if is_non_torch_model(model_path) else device,
+            "device": plan.device,
+            "backend": plan.backend,
             "imgsz": settings.inference_imgsz,
-            "half": settings.inference_half and device != "cpu",
+            "half": plan.half,
             "frame_stride": settings.frame_stride,
             "process_width": settings.process_width or None,
             "threads_per_worker": runtime.threads_per_worker(
-                settings.threads_per_worker, settings.expected_streams, gpu=accelerated
+                settings.threads_per_worker,
+                settings.expected_streams,
+                gpu=not plan.cpu_bound,
             ),
             "ffmpeg_hwaccel": settings.ffmpeg_hwaccel or None,
         },

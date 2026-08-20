@@ -24,9 +24,9 @@ from ..models import (
     PlateRead,
     Source,
 )
-from ..runtime import apply_worker_threads, threads_per_worker
+from ..runtime import apply_worker_threads, pin_worker_affinity, threads_per_worker
 from .alpr import ALPR
-from .detector import Detector, is_non_torch_model, pick_device
+from .detector import Detector, plan_inference
 from .face import FaceRecognizer, face_bbox
 from .frame_store import SharedState
 from .line_counter import LineCounter
@@ -99,15 +99,16 @@ class _Throughput:
 def _ocr_device(detector_device: str) -> str:
     """Device for EasyOCR: explicit setting wins, else follow the detector.
 
-    MPS is deliberately not inherited: EasyOCR's recognition network is small,
-    parts of it fall back to the CPU anyway, and sharing the GPU with YOLO
-    tends to slow both down.
+    Only CUDA is inherited. MPS is deliberately not: EasyOCR's recognition
+    network is small, parts of it fall back to the CPU anyway, and sharing the
+    GPU with YOLO tends to slow both down. The OpenVINO device strings
+    ("intel:gpu") mean nothing to EasyOCR at all -- it is a torch model.
     """
     if settings.ocr_device:
         return settings.ocr_device
-    if detector_device in ("cpu", "mps"):
-        return "cpu"
-    return detector_device
+    if detector_device.startswith("cuda") or detector_device.isdigit():
+        return detector_device
+    return "cpu"
 
 
 def _now() -> datetime:
@@ -176,20 +177,23 @@ def _draw(frame, detections, counter: LineCounter | None, source_cfg: dict, plat
     return frame
 
 
-def run_worker(source_cfg: dict, shared: SharedState, stop_event) -> None:
+def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0) -> None:
     source_id = source_cfg["id"]
     shared.set_status(source_id, "starting")
     _update_db_status(source_id, "starting")
 
     # Every source is its own process. Cap the thread pools before touching
     # OpenCV/torch, otherwise each worker grabs all cores and they thrash.
+    # An accelerated worker (MPS/CUDA/CoreML/OpenVINO GPU) only pre- and
+    # post-processes on the CPU; an OpenVINO *CPU* worker does the whole
+    # inference there and needs the full budget.
     model_path = settings.yolo_model_path
-    accelerated = pick_device(settings.device) != "cpu" or is_non_torch_model(model_path)
-    apply_worker_threads(
-        threads_per_worker(
-            settings.threads_per_worker, settings.expected_streams, gpu=accelerated
-        )
+    plan = plan_inference(model_path, settings.device, settings.inference_half)
+    n_threads = threads_per_worker(
+        settings.threads_per_worker, settings.expected_streams, gpu=not plan.cpu_bound
     )
+    apply_worker_threads(n_threads)
+    pin_worker_affinity(slot, n_threads, settings.worker_cpu_affinity)
 
     try:
         detector = Detector(

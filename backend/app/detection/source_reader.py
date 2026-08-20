@@ -116,10 +116,59 @@ CHUNKED_SOURCE_TYPES = ("hls", "http", "youtube")
 LIVE_SOURCE_TYPES = REALTIME_SOURCE_TYPES + CHUNKED_SOURCE_TYPES
 
 
+# Hardware decoders OpenCV can select itself through CAP_PROP_HW_ACCELERATION.
+# This is the documented API; the "hwaccel" key below is an FFmpeg *CLI* option
+# and is not understood by avformat_open_input, so anything routed through the
+# capture-options string relies on FFmpeg picking the decoder on its own.
+_SOFTWARE_MODES = ("", "off", "none", "software")
+
+# Our setting name -> the cv2.VIDEO_ACCELERATION_* suffix it maps to. Resolved
+# with getattr rather than up front: builds differ in which types they expose
+# (VIDEO_ACCELERATION_DRM only appeared in OpenCV 4.12), and a missing one must
+# degrade instead of raising in the middle of a worker.
+_ACCELERATION_TYPES = {
+    # "Prefer hardware, fall back to software" -- D3D11VA on Windows,
+    # VAAPI on Linux, VideoToolbox on macOS.
+    "auto": "ANY",
+    "any": "ANY",
+    "d3d11va": "D3D11",
+    "d3d11": "D3D11",
+    "dxva2": "D3D11",
+    # Intel Quick Sync, via the Media SDK / oneVPL path.
+    "qsv": "MFX",
+    "mfx": "MFX",
+    "vaapi": "VAAPI",
+    "drm": "DRM",
+}
+
+
+def _hw_acceleration(hwaccel: str) -> int | None:
+    """Map our FFMPEG_HWACCEL setting onto an OpenCV acceleration constant.
+
+    Returns None for values this OpenCV build cannot express as an acceleration
+    type -- either because they are not one ("videotoolbox", "cuda") or because
+    the build predates it. Those keep going through the FFmpeg option string.
+    """
+    mode = (hwaccel or "").strip().lower()
+    if mode in _SOFTWARE_MODES:
+        return getattr(cv2, "VIDEO_ACCELERATION_NONE", None)
+    name = _ACCELERATION_TYPES.get(mode)
+    if name is None:
+        return None
+    return getattr(cv2, f"VIDEO_ACCELERATION_{name}", None)
+
+
 def _capture_options(source_type: str, hwaccel: str, rtsp_tcp: bool) -> str:
-    """Build the ``key;value|key;value`` string OpenCV passes to FFmpeg."""
+    """Build the ``key;value|key;value`` string OpenCV passes to FFmpeg.
+
+    Only protocol/container level options belong here -- those are real
+    AVFormat options. Hardware decoding is requested separately, through
+    :func:`_hw_acceleration`, except for the backends OpenCV has no constant
+    for (VideoToolbox, NVDEC).
+    """
     opts: list[str] = []
-    if hwaccel:
+    mode = (hwaccel or "").strip().lower()
+    if mode not in _SOFTWARE_MODES and _hw_acceleration(hwaccel) is None:
         # e.g. "videotoolbox" on Apple Silicon: H.264/HEVC decoding moves to
         # the dedicated media engine, freeing the CPU cores for inference.
         opts.append(f"hwaccel;{hwaccel}")
@@ -159,16 +208,18 @@ class SourceReader:
         self.fps: float = 0.0
         # Set to False once hardware decoding has been proven not to work for
         # this stream, so we don't pay the failed-open cost on every reconnect.
-        self._hwaccel_ok = bool(hwaccel)
+        self._hwaccel_ok = hwaccel.strip().lower() not in _SOFTWARE_MODES
         self._cap: cv2.VideoCapture | None = None
 
     def _try_open(self, stream_url: str, hwaccel: str) -> cv2.VideoCapture | None:
         options = _capture_options(self.source_type, hwaccel, self.rtsp_tcp)
+        accel = _hw_acceleration(hwaccel)
+        params = [cv2.CAP_PROP_HW_ACCELERATION, accel] if accel is not None else []
         previous = os.environ.get(_CAPTURE_OPTIONS_ENV)
         if options:
             os.environ[_CAPTURE_OPTIONS_ENV] = options
         try:
-            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+            cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG, params)
         finally:
             if options:
                 if previous is None:

@@ -36,12 +36,16 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24  # 1 day
 
     # --- Detection ---
-    # Ultralytics weights. "yolo11n.pt" auto-downloads on first use. On Apple
-    # Silicon this may also be a CoreML bundle ("yolo11n.mlpackage") exported
-    # with scripts/export_coreml.py, which runs on the Neural Engine.
+    # Ultralytics weights. "yolo11n.pt" auto-downloads on first use. It may
+    # also be an accelerator-specific export:
+    #   - CoreML bundle  ("yolo11n.mlpackage",        scripts/export_coreml.py)
+    #   - OpenVINO IR    ("yolo11n_openvino_model/",  scripts/export_openvino.py)
+    # Both have a FIXED input size, so inference_imgsz must match the export.
     yolo_model: str = "yolo11n.pt"
-    # Force a device ("cpu" / "cuda" / "mps" / "0"). Empty string => auto-detect
-    # (cuda -> mps -> cpu).
+    # Force a device ("cpu" / "cuda" / "mps" / "0", or "intel:gpu" / "intel:cpu"
+    # for an OpenVINO model). Empty string => auto-detect: cuda -> mps -> cpu
+    # for torch weights, Intel iGPU (else the OpenVINO CPU plugin) for an
+    # OpenVINO model.
     device: str = ""
     # Inference image size (smaller = faster on CPU).
     inference_imgsz: int = 640
@@ -62,10 +66,18 @@ class Settings(BaseSettings):
     # How many sources you plan to run at once; used to split CPU cores between
     # worker processes when threads_per_worker is auto.
     expected_streams: int = 4
-    # FFmpeg hardware decoder for network streams. "videotoolbox" on macOS,
-    # "cuda" on NVIDIA, empty = software decoding. Falls back to software
-    # automatically if the stream cannot be opened with it.
-    ffmpeg_hwaccel: str = ""
+    # Give each worker its own slice of the CPU ("auto" / "off"). Thread-count
+    # env vars do not reach every backend -- the OpenVINO CPU plugin schedules
+    # on TBB and only honours the process affinity mask. No-op on macOS.
+    worker_cpu_affinity: str = "auto"
+    # Hardware video decoding for network streams:
+    #   "auto"         let OpenCV pick (D3D11VA on Windows, VAAPI on Linux,
+    #                  VideoToolbox on macOS) and fall back to software itself
+    #   "off" / ""     software decoding
+    #   "d3d11va" / "qsv" / "vaapi"   force one backend
+    #   "videotoolbox" / "cuda"       passed to FFmpeg as a capture option
+    # Falls back to software automatically if the stream cannot be opened.
+    ffmpeg_hwaccel: str = "auto"
     # Force RTSP over TCP (far fewer corrupt frames than the UDP default).
     rtsp_transport_tcp: bool = True
     # Cap the YouTube stream resolution. A live YouTube feed is often 1080p or

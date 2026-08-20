@@ -147,6 +147,83 @@ backend/.venv/bin/python scripts/benchmark.py --model data/weights/yolo11s.pt --
 Masih bisa memakai Docker di Mac (`docker compose up --build`) — jalan normal,
 tetapi **CPU-only**, jadi ±2.7× lebih lambat dari mode native.
 
+## Menjalankan di Windows (AMD Ryzen / Intel Core) 🪟
+
+Docker Desktop di Windows tidak bisa mem-passthrough iGPU, jadi instalasi
+native adalah satu-satunya cara mendapat akselerasi di dua mesin ini. Jalur
+inferensinya **OpenVINO** untuk keduanya:
+
+| Mesin | Device | Model | Alasan |
+| --- | --- | --- | --- |
+| Ryzen 7 PRO 7840U (8C/16T, Zen 4) | `intel:cpu` | `yolo11s` INT8 | Plugin CPU OpenVINO vendor-neutral dan memakai AVX-512/VNNI Zen 4 |
+| Core i7 gen-7 (2C/4T, HD Graphics) | `intel:gpu` | `yolo11n` FP16, imgsz 480 | Dua core CPU terlalu sedikit; iGPU Gen9 didukung plugin GPU OpenVINO |
+
+```powershell
+git clone <repo> && cd detection
+.\scripts\setup_windows.ps1        # deteksi CPU -> pilih profil, export model
+# edit .env (ADMIN_PASSWORD, JWT_SECRET)
+.\scripts\run_windows.ps1          # http://localhost:8000
+```
+
+Script setup memilih profil dari vendor CPU, memasang torch CPU + OpenVINO,
+mengunduh bobot, meng-export IR OpenVINO, dan menyalin `.env.amd.example` atau
+`.env.intel.example` menjadi `.env`. Paksa profil dengan
+`.\scripts\setup_windows.ps1 -Hardware intel`.
+
+Cek device yang benar-benar dipakai:
+
+```powershell
+curl http://localhost:8000/api/health
+# "device": "intel:cpu", "backend": "openvino",
+# "physical_cores": 8, "openvino_devices": ["CPU"]
+```
+
+### Hasil pengukuran (Ryzen 7 PRO 7840U, 1080p, imgsz=640, deteksi saja)
+
+| Model | torch CPU | OpenVINO CPU | OpenVINO CPU INT8 |
+| --- | --- | --- | --- |
+| yolo11n | 33 fps | 60 fps | **73 fps** |
+| yolo11s | 17 fps | — | **44 fps** |
+
+Dipin ke 2 core (jatah 1 worker saat `EXPECTED_STREAMS=4`), yolo11n INT8 masih
+55 fps — cukup untuk empat stream 25 fps dengan `FRAME_STRIDE=2`.
+
+Ukur di mesin sendiri:
+
+```powershell
+backend\.venv\Scripts\python scripts\benchmark.py `
+  --model data\weights\yolo11s_int8_openvino_model --imgsz 640
+```
+
+### Apa saja yang dioptimalkan
+
+- **Inferensi lewat OpenVINO** — export sekali dengan
+  `scripts/export_openvino.py` (`--half` untuk iGPU Intel, `--int8` untuk Zen 4),
+  lalu `YOLO_MODEL` diarahkan ke direktori `*_openvino_model`. Device dipilih
+  otomatis: iGPU Intel bila ada, kalau tidak plugin CPU.
+  ⚠️ IR punya **ukuran input tetap** — `INFERENCE_IMGSZ` wajib sama dengan
+  `--imgsz` saat export.
+- **Hitung core fisik, bukan logis** — sebelumnya `os.cpu_count()` melaporkan 16
+  di 7840U, sehingga setiap worker minta thread 2× lebih banyak dari core yang
+  ada dan saling rebut SMT sibling. Sekarang 8.
+- **Affinity per worker** — tiap worker dikunci ke potongan core-nya sendiri.
+  Ini satu-satunya tuas yang mengikat plugin CPU OpenVINO: ia menjadwal di atas
+  TBB dan mengabaikan `OMP_NUM_THREADS`, tetapi menghormati affinity mask.
+  Matikan dengan `WORKER_CPU_AFFINITY=off`.
+- **Budget thread sadar-backend** — worker OpenVINO **CPU** mendapat jatah
+  thread penuh, worker akselerator (MPS/CUDA/CoreML/OpenVINO GPU) tetap 2.
+- **Decode video di hardware** — `FFMPEG_HWACCEL=auto` lewat
+  `CAP_PROP_HW_ACCELERATION` milik OpenCV: D3D11VA di Windows, VAAPI di Linux,
+  VideoToolbox di macOS, dengan fallback software di dalam OpenCV sendiri.
+  Bisa dipaksa: `d3d11va`, `qsv`, `vaapi`, atau `off`.
+
+### Kenapa iGPU Radeon 780M tidak dipakai
+
+Plugin GPU OpenVINO hanya mendukung GPU Intel (`Core().available_devices` di
+7840U memang hanya melaporkan `CPU`). Jalur DirectML butuh backend ONNX kustom
+karena ultralytics tidak pernah mendaftarkan `DmlExecutionProvider`. Karena
+plugin CPU dengan INT8 sudah memberi 2.2×, kompleksitas itu tidak sepadan.
+
 ## Menjalankan tanpa Docker (development)
 
 **Backend:**
