@@ -34,6 +34,20 @@ $Backend = Join-Path $Root 'backend'
 $Venv    = Join-Path $Backend '.venv'
 $Py      = Join-Path $Venv 'Scripts\python.exe'
 
+# $ErrorActionPreference only governs PowerShell cmdlets -- a native program
+# that exits non-zero does NOT stop the script. Without this every pip/python
+# failure below would scroll past and the script would still say "complete",
+# leaving a half-built venv that only breaks later at runtime.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$What,
+          [Parameter(Mandatory)][string]$Exe,
+          [Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
+    & $Exe @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$What failed (exit $LASTEXITCODE): $Exe $($Arguments -join ' ')"
+    }
+}
+
 Write-Host '==> Checking the machine' -ForegroundColor Cyan
 $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1)
 Write-Host "    $($cpu.Name)"
@@ -66,34 +80,76 @@ if ($Hardware -eq 'intel') {
 }
 
 Write-Host '==> Checking prerequisites' -ForegroundColor Cyan
+# The pinned wheels (numpy, opencv, easyocr) and openvino only publish for
+# 3.11-3.13. Picking whatever "python" happens to be on PATH is how you end up
+# watching pip try to compile numpy from source.
+$SupportedPython = @('3.12', '3.11', '3.13')
 $python = $null
-foreach ($candidate in @('python3.12', 'python3.11', 'python')) {
-    $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($cmd) { $python = $cmd.Source; break }
+$launcher = Get-Command py -ErrorAction SilentlyContinue
+foreach ($v in $SupportedPython) {
+    if ($launcher) {
+        # The py launcher is the normal way to reach a specific version on Windows.
+        & $launcher.Source "-$v" -c "import sys" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $python = @($launcher.Source, "-$v"); break
+        }
+    }
+    $cmd = Get-Command "python$v" -ErrorAction SilentlyContinue
+    if ($cmd) { $python = @($cmd.Source); break }
 }
-if (-not $python) { throw 'No python found. Install Python 3.11 or 3.12 from python.org.' }
-Write-Host "    using $python ($(& $python -V))"
+if (-not $python) {
+    # Fall back to plain "python", but only if its version is one we support.
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $ver = (& $cmd.Source -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null)
+        if ($SupportedPython -contains $ver) { $python = @($cmd.Source) }
+        else {
+            throw ("Found Python $ver on PATH, but the pinned dependencies only " +
+                   "have wheels for $($SupportedPython -join ', '). Install one " +
+                   "(winget install Python.Python.3.12) and re-run.")
+        }
+    }
+}
+if (-not $python) {
+    throw "No supported Python found. Install 3.12 (winget install Python.Python.3.12) and re-run."
+}
+Write-Host "    using $($python -join ' ') ($(& $python[0] @($python[1..($python.Length-1)]) -V))"
 
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Warning 'ffmpeg not on PATH. OpenCV ships its own for decoding, but the CLI is handy for testing (winget install Gyan.FFmpeg).'
 }
 
 Write-Host '==> Creating the virtualenv at backend\.venv' -ForegroundColor Cyan
-if (-not (Test-Path $Py)) { & $python -m venv $Venv }
-& $Py -m pip install --upgrade pip wheel | Out-Null
+if (-not (Test-Path $Py)) {
+    Invoke-Native 'venv creation' $python[0] @($python[1..($python.Length - 1)]) -m venv $Venv
+}
+Invoke-Native 'pip self-upgrade' $Py -m pip install --upgrade pip wheel
 
 Write-Host '==> Installing PyTorch (CPU build)' -ForegroundColor Cyan
 # Inference runs through OpenVINO; torch is still needed by ultralytics for
 # pre/post-processing and by EasyOCR, so the small CPU wheel is enough.
-& $Py -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+Invoke-Native 'torch install' $Py -m pip install torch torchvision `
+    --index-url https://download.pytorch.org/whl/cpu
 
 Write-Host '==> Installing the backend requirements' -ForegroundColor Cyan
-& $Py -m pip install -r (Join-Path $Backend 'requirements.txt')
+Invoke-Native 'requirements.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements.txt')
 
 Write-Host '==> Installing the OpenVINO runtime' -ForegroundColor Cyan
-& $Py -m pip install -r (Join-Path $Backend 'requirements-openvino.txt')
+Invoke-Native 'requirements-openvino.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements-openvino.txt')
 
-$devices = & $Py -c "import openvino as ov; print(','.join(ov.Core().available_devices))"
+Write-Host '==> Checking the OpenVINO runtime loads' -ForegroundColor Cyan
+$devices = & $Py -c "import openvino as ov; print(','.join(ov.Core().available_devices))" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host $devices
+    if ("$devices" -match 'DLL load failed') {
+        # openvino's native extension links against the MSVC runtime, which is
+        # not part of a stock Windows install and not shipped in the wheel.
+        throw ("OpenVINO installed but its native module will not load. This is " +
+               "almost always the missing Microsoft Visual C++ Redistributable: " +
+               "winget install Microsoft.VCRedist.2015+.x64   (then reboot and re-run).")
+    }
+    throw "OpenVINO installed but 'import openvino' failed -- see the error above."
+}
 Write-Host "    OpenVINO devices: $devices" -ForegroundColor Yellow
 if ($Hardware -eq 'intel' -and $devices -notmatch 'GPU') {
     Write-Warning 'No OpenVINO GPU device found. Update the Intel Graphics driver, then re-run. Falling back to the CPU plugin for now.'
@@ -106,7 +162,7 @@ if (-not (Test-Path (Join-Path $Weights $YoloModel))) {
     Push-Location $Weights
     try {
         $env:YOLO_CONFIG_DIR = $Weights
-        & $Py -c "from ultralytics import YOLO; YOLO('$YoloModel')"
+        Invoke-Native "download of $YoloModel" $Py -c "from ultralytics import YOLO; YOLO('$YoloModel')"
     } finally { Pop-Location }
 }
 $faceModels = @{
@@ -121,20 +177,23 @@ foreach ($name in $faceModels.Keys) {
 Write-Host "==> Exporting $YoloModel to OpenVINO IR (imgsz=$ImgSz $ExportArgs)" -ForegroundColor Cyan
 Push-Location $Backend
 try {
-    & $Py (Join-Path $Root 'scripts\export_openvino.py') `
+    Invoke-Native 'OpenVINO export' $Py (Join-Path $Root 'scripts\export_openvino.py') `
         --model (Join-Path $Weights $YoloModel) --imgsz $ImgSz @ExportArgs
 } finally { Pop-Location }
 
 if ($WarmEasyOcr) {
     Write-Host '==> Warming up EasyOCR (downloads its models once)' -ForegroundColor Cyan
-    & $Py -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False)" | Out-Null
+    Invoke-Native 'EasyOCR warmup' $Py -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False)"
 }
 
 if (-not $SkipFrontend) {
     Write-Host '==> Building the frontend' -ForegroundColor Cyan
     if (Get-Command npm -ErrorAction SilentlyContinue) {
         Push-Location (Join-Path $Root 'frontend')
-        try { npm install; npm run build } finally { Pop-Location }
+        try {
+            Invoke-Native 'npm install' 'npm.cmd' install
+            Invoke-Native 'npm run build' 'npm.cmd' run build
+        } finally { Pop-Location }
     } else {
         Write-Warning 'npm not found - skipping. Install Node, then: cd frontend; npm install; npm run build'
     }
