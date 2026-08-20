@@ -142,6 +142,19 @@ _ACCELERATION_TYPES = {
 }
 
 
+# A hardware decoder that cannot cope with a stream rarely refuses to open it.
+# It opens fine and then gives up on the first picture that needs a reference
+# frame ("hardware accelerator failed to decode picture", D3D11VA's 0x80070057
+# / E_INVALIDARG). OpenCV reports that as a failed read, the reconnect loop
+# restarts the capture mid-GOP, and the source ends up cycling instead of
+# playing. So a session that dies before delivering this many frames counts as
+# a decoder failure rather than a network drop...
+_HWACCEL_MIN_HEALTHY_FRAMES = 30
+# ...and hardware decoding is only ruled out after this many of them in a row,
+# so a camera that is genuinely flapping is not misdiagnosed as a codec problem.
+_HWACCEL_MAX_SHORT_SESSIONS = 2
+
+
 def _hw_acceleration(hwaccel: str) -> int | None:
     """Map our FFMPEG_HWACCEL setting onto an OpenCV acceleration constant.
 
@@ -209,6 +222,10 @@ class SourceReader:
         # Set to False once hardware decoding has been proven not to work for
         # this stream, so we don't pay the failed-open cost on every reconnect.
         self._hwaccel_ok = hwaccel.strip().lower() not in _SOFTWARE_MODES
+        # Frames delivered by the current capture, and how many captures in a
+        # row died before delivering enough of them to look healthy.
+        self._frames_since_open = 0
+        self._short_sessions = 0
         self._cap: cv2.VideoCapture | None = None
 
     def _try_open(self, stream_url: str, hwaccel: str) -> cv2.VideoCapture | None:
@@ -237,6 +254,7 @@ class SourceReader:
         return cap
 
     def _open(self) -> cv2.VideoCapture:
+        self._frames_since_open = 0
         stream_url = resolve_stream_url(self.source_type, self.url, self.youtube_max_height)
         if self._hwaccel_ok:
             cap = self._try_open(stream_url, self.hwaccel)
@@ -255,6 +273,32 @@ class SourceReader:
             raise SourceOpenError(f"Failed to open source: {self.url}")
         self._read_fps(cap)
         return cap
+
+    def _note_failed_session(self) -> bool:
+        """Record a capture that ended in a read failure.
+
+        Returns True when hardware decoding has just been ruled out, in which
+        case the caller should reconnect straight away: the next open uses the
+        software decoder, so there is nothing to wait for.
+        """
+        if not self._hwaccel_ok:
+            return False
+        if self._frames_since_open >= _HWACCEL_MIN_HEALTHY_FRAMES:
+            # The stream played before it dropped, so the decoder is fine and
+            # this was the network. Forget any earlier short sessions.
+            self._short_sessions = 0
+            return False
+        self._short_sessions += 1
+        if self._short_sessions < _HWACCEL_MAX_SHORT_SESSIONS:
+            return False
+        print(
+            f"[SourceReader] hwaccel '{self.hwaccel}' delivered fewer than "
+            f"{_HWACCEL_MIN_HEALTHY_FRAMES} frames in {self._short_sessions} "
+            f"attempts on this {self.source_type} source -- the hardware "
+            "decoder is rejecting the stream; switching to software decoding"
+        )
+        self._hwaccel_ok = False
+        return True
 
     def _read_fps(self, cap: cv2.VideoCapture) -> None:
         try:
@@ -285,13 +329,16 @@ class SourceReader:
             try:
                 ok, frame = self._cap.read()
                 if not ok or frame is None:
-                    # End of file or transient network drop -> reconnect.
+                    # End of file, a transient network drop, or a decoder that
+                    # gave up on the stream -> reconnect.
                     self._release()
                     if self.source_type == "file":
                         # A local file simply ended.
                         return
-                    time.sleep(self.reconnect_delay)
+                    if not self._note_failed_session():
+                        time.sleep(self.reconnect_delay)
                     continue
+                self._frames_since_open += 1
                 yield frame
             except Exception:
                 self._release()

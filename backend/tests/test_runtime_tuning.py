@@ -28,8 +28,10 @@ from app.detection.source_reader import (  # noqa: E402
     REALTIME_SOURCE_TYPES,
     _ACCELERATION_TYPES,
     _capture_options,
+    _HWACCEL_MIN_HEALTHY_FRAMES,
     _hw_acceleration,
     _yt_format,
+    SourceReader,
 )
 from app.config import settings  # noqa: E402
 from app.detection.worker import _ocr_device  # noqa: E402
@@ -149,6 +151,53 @@ def test_hwaccel_survives_an_opencv_without_every_constant():
         assert "hwaccel" not in _capture_options("rtsp", mode, False)
     print(f"OK hwaccel_survives_an_opencv_without_every_constant "
           f"(cv2 {cv2.__version__}, missing: {missing or 'none'})")
+
+
+def _reader_after(sessions):
+    """Replay a list of per-session frame counts through the hwaccel guard.
+
+    Each entry is how many frames one capture delivered before its read failed.
+    Returns the reader so the caller can inspect whether hardware decoding
+    survived.
+    """
+    reader = SourceReader("rtsp", "rtsp://cam/stream", hwaccel="auto")
+    for frames in sessions:
+        reader._frames_since_open = frames
+        reader._note_failed_session()
+    return reader
+
+
+def test_hwaccel_falls_back_when_the_decoder_keeps_giving_up():
+    # D3D11VA on an Intel iGPU opens an HEVC stream happily and only fails on
+    # the first picture needing a reference frame, so the failure shows up as
+    # a capture that dies almost immediately. Two of those in a row and we
+    # stop paying for the hardware path.
+    assert not _reader_after([0, 0])._hwaccel_ok
+    assert not _reader_after([1, 2])._hwaccel_ok
+    # One short session on its own is not enough to conclude anything.
+    assert _reader_after([0])._hwaccel_ok
+    print("OK hwaccel_falls_back_when_the_decoder_keeps_giving_up")
+
+
+def test_a_flapping_camera_is_not_mistaken_for_a_broken_decoder():
+    # A stream that plays and then drops is a network problem; hardware
+    # decoding must survive it however often it happens.
+    healthy = _HWACCEL_MIN_HEALTHY_FRAMES
+    assert _reader_after([healthy] * 5)._hwaccel_ok
+    # ...and a good session clears the short ones that came before it, so
+    # unrelated drops never add up to a false diagnosis.
+    assert _reader_after([0, healthy, 0])._hwaccel_ok
+    print("OK a_flapping_camera_is_not_mistaken_for_a_broken_decoder")
+
+
+def test_software_decoding_needs_no_fallback():
+    reader = SourceReader("rtsp", "rtsp://cam/stream", hwaccel="off")
+    assert not reader._hwaccel_ok
+    # Nothing to fall back to, so a failed session must not ask the read loop
+    # to skip its reconnect delay and spin.
+    reader._frames_since_open = 0
+    assert reader._note_failed_session() is False
+    print("OK software_decoding_needs_no_fallback")
 
 
 def test_source_types_are_disjoint():

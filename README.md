@@ -271,7 +271,7 @@ otomatis menyajikan `frontend/dist`.
 | `PROCESS_WIDTH` | 0 | perkecil frame ke lebar ini sebelum deteksi (0 = asli) |
 | `THREADS_PER_WORKER` | 0 | thread CPU per worker (0 = otomatis dari jumlah P-core) |
 | `EXPECTED_STREAMS` | 4 | perkiraan jumlah source aktif, untuk pembagian thread |
-| `FFMPEG_HWACCEL` | *(kosong)* | `videotoolbox` (macOS) / `cuda` (NVIDIA) |
+| `FFMPEG_HWACCEL` | `auto` | decoding di hardware; `off` untuk software (lihat *Troubleshooting* untuk kamera H.265) |
 | `RTSP_TRANSPORT_TCP` | true | paksa RTSP lewat TCP |
 | `YOUTUBE_MAX_HEIGHT` | 720 | batas resolusi stream YouTube |
 | `CAPTURE_BUFFER_SECONDS` | 2 | jitter buffer untuk HLS/YouTube (RAM: ±83 MB/detik pada 720p) |
@@ -353,6 +353,40 @@ Beberapa hal yang perlu diketahui:
 - **`CAPTURE_BUFFER_SECONDS`** memperhalus HLS yang datang per segmen, tapi
   menyimpan frame mentah: ±83 MB per detik buffer pada 720p. Menaikkannya di
   atas ±4 detik jarang sepadan.
+
+### Windows: `hardware accelerator failed to decode picture` (HEVC/H.265)
+
+Log seperti ini muncul saat kamera H.265 di-decode oleh iGPU Intel:
+
+```
+[hevc @ ...] Could not find ref with POC 44
+[hevc @ ...] Failed to execute: 0x80070057
+[hevc @ ...] hardware accelerator failed to decode picture
+```
+
+Baris `Could not find ref with POC N` dan `Non-matching NAL types` berarti
+**paket stream hilang** sebelum sampai ke decoder, jadi frame referensi yang
+dibutuhkan tidak pernah datang. Decoder software cuma menampilkan artefak dan
+jalan terus; D3D11VA/DXVA langsung menyerah dengan `0x80070057` (E_INVALIDARG),
+capture-nya mati, lalu reconnect di tengah GOP — dan siklusnya berulang.
+
+Urutan penanganannya:
+
+1. **Pastikan RTSP lewat TCP** — `RTSP_TRANSPORT_TCP=true` (default). Lewat UDP,
+   satu paket hilang saja sudah cukup memicu pola di atas.
+2. **Set kamera ke H.264, bukan H.265.** Ini perbaikan yang paling manjur:
+   decoder H.264 di HD Graphics jauh lebih tahan terhadap paket rusak, dan
+   substream 720p H.264 sudah lebih dari cukup untuk deteksi.
+3. **Matikan hardware decoding:** `FFMPEG_HWACCEL=off`. Decoding pindah ke CPU
+   (mahal di mesin kecil, tapi tahan terhadap frame rusak) dan iGPU-nya bebas
+   penuh untuk inference OpenVINO.
+4. Kalau jaringannya memang bermasalah, cek kabel/switch/Wi-Fi kamera dan
+   turunkan bitrate substream.
+
+Sejak versi ini, langkah 3 juga berjalan otomatis: bila hardware decoder gagal
+mengirim frame dua kali berturut-turut, source pindah sendiri ke software
+decoding sampai worker di-restart, dan log akan mencatat
+`switching to software decoding`.
 
 ### YouTube: `No video formats found!` / source status `error`
 
