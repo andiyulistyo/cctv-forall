@@ -86,14 +86,23 @@ Write-Host '==> Checking prerequisites' -ForegroundColor Cyan
 $SupportedPython = @('3.12', '3.11', '3.13')
 $python = $null
 $launcher = Get-Command py -ErrorAction SilentlyContinue
-foreach ($v in $SupportedPython) {
-    if ($launcher) {
-        # The py launcher is the normal way to reach a specific version on Windows.
-        & $launcher.Source "-$v" -c "import sys" 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            $python = @($launcher.Source, "-$v"); break
-        }
+# "py -0p" lists the installed versions on stdout, so we can pick one without
+# probing each in turn. That matters: probing meant redirecting a native
+# command's stderr, and in Windows PowerShell 5.1 that wraps every stderr line
+# in an ErrorRecord which $ErrorActionPreference='Stop' then turns into a
+# terminating error -- so a missing 3.12 would kill the script instead of
+# falling through to 3.11.
+$installed = @()
+if ($launcher) {
+    $listing = & $launcher.Source -0p
+    if ($LASTEXITCODE -eq 0) {
+        $installed = @($listing | ForEach-Object {
+            if ($_ -match '-V:(\d+\.\d+)') { $Matches[1] }
+        })
     }
+}
+foreach ($v in $SupportedPython) {
+    if ($installed -contains $v) { $python = @($launcher.Source, "-$v"); break }
     $cmd = Get-Command "python$v" -ErrorAction SilentlyContinue
     if ($cmd) { $python = @($cmd.Source); break }
 }
@@ -101,7 +110,7 @@ if (-not $python) {
     # Fall back to plain "python", but only if its version is one we support.
     $cmd = Get-Command python -ErrorAction SilentlyContinue
     if ($cmd) {
-        $ver = (& $cmd.Source -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null)
+        $ver = & $cmd.Source -c "import sys; print('%d.%d' % sys.version_info[:2])"
         if ($SupportedPython -contains $ver) { $python = @($cmd.Source) }
         else {
             throw ("Found Python $ver on PATH, but the pinned dependencies only " +
@@ -138,18 +147,35 @@ Write-Host '==> Installing the OpenVINO runtime' -ForegroundColor Cyan
 Invoke-Native 'requirements-openvino.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements-openvino.txt')
 
 Write-Host '==> Checking the OpenVINO runtime loads' -ForegroundColor Cyan
-$devices = & $Py -c "import openvino as ov; print(','.join(ov.Core().available_devices))" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host $devices
-    if ("$devices" -match 'DLL load failed') {
+# The probe reports its own failure on stdout rather than letting Python write a
+# traceback to stderr. Capturing native stderr in PowerShell 5.1 (2>&1 or 2>file)
+# wraps each line in an ErrorRecord, which under $ErrorActionPreference='Stop'
+# aborts the script with "NativeCommandError" and hides the message we need.
+# Single-quoted on the Python side on purpose: PowerShell drops embedded double
+# quotes when it hands an argument to a native command.
+$probe = @'
+import sys
+try:
+    import openvino as ov
+except Exception as exc:
+    print('FAILED|%s: %s' % (type(exc).__name__, exc))
+    sys.exit(2)
+print('OK|' + ','.join(ov.Core().available_devices))
+'@
+$result = & $Py -c $probe
+if ($LASTEXITCODE -ne 0 -or "$result" -notmatch '^OK\|') {
+    Write-Host "    $result" -ForegroundColor Red
+    if ("$result" -match 'DLL load failed') {
         # openvino's native extension links against the MSVC runtime, which is
         # not part of a stock Windows install and not shipped in the wheel.
         throw ("OpenVINO installed but its native module will not load. This is " +
                "almost always the missing Microsoft Visual C++ Redistributable: " +
-               "winget install Microsoft.VCRedist.2015+.x64   (then reboot and re-run).")
+               "  winget install --id Microsoft.VCRedist.2015+.x64 -e" + [Environment]::NewLine +
+               "Install it, reboot, and re-run this script.")
     }
-    throw "OpenVINO installed but 'import openvino' failed -- see the error above."
+    throw "OpenVINO installed but 'import openvino' failed -- see the message above."
 }
+$devices = ("$result" -split '\|', 2)[1]
 Write-Host "    OpenVINO devices: $devices" -ForegroundColor Yellow
 if ($Hardware -eq 'intel' -and $devices -notmatch 'GPU') {
     Write-Warning 'No OpenVINO GPU device found. Update the Intel Graphics driver, then re-run. Falling back to the CPU plugin for now.'
