@@ -7,6 +7,7 @@ counters + status into the shared state for the API to serve.
 """
 from __future__ import annotations
 
+import signal
 import time
 from datetime import datetime, timezone
 
@@ -178,6 +179,16 @@ def _draw(frame, detections, counter: LineCounter | None, source_cfg: dict, plat
 
 
 def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0) -> None:
+    # Ctrl-C is delivered to every process attached to the console (a process
+    # group signal on POSIX, CTRL_C_EVENT on Windows), so without this a worker
+    # dies with a KeyboardInterrupt traceback out of the middle of an inference
+    # call. Stopping us is the manager's job -- it sets stop_event and joins --
+    # so ignore the signal and leave through the normal path instead.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
     source_id = source_cfg["id"]
     shared.set_status(source_id, "starting")
     _update_db_status(source_id, "starting")
@@ -387,6 +398,9 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
                 detector.trim_memory()
                 last_trim = now
 
+        shared.set_status(source_id, "stopped")
+        _update_db_status(source_id, "stopped")
+    except KeyboardInterrupt:
         shared.set_status(source_id, "stopped")
         _update_db_status(source_id, "stopped")
     except Exception as exc:

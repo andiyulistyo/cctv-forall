@@ -1,6 +1,7 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,13 +14,43 @@ from sqlalchemy import update
 from .auth import ensure_admin_user
 from .config import settings
 from .database import SessionLocal, init_db
-from .detection.manager import get_manager, init_manager
+from .detection.manager import SHUTTING_DOWN, get_manager, init_manager
 from .models import Source
 from .retention import start_scheduler, stop_scheduler
 from . import runtime
 from .api import auth_routes, counts, faces, plates, sources, streams
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+
+def _install_shutdown_signal_handlers() -> None:
+    """Flip SHUTTING_DOWN the moment Ctrl-C arrives.
+
+    The MJPEG endpoints are endless generators that only stop once that event
+    is set, and uvicorn runs the lifespan shutdown -- where the manager sets it
+    -- *after* every in-flight response has finished. Each side ends up waiting
+    for the other, which is why Ctrl-C used to hang on "Waiting for connections
+    to close". Set it from the signal itself, then hand over to whoever was
+    handling the signal already (uvicorn) so the rest of shutdown is unchanged.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous = signal.getsignal(sig)
+        except (ValueError, OSError):
+            continue
+        # No existing handler means nothing is arranging a graceful stop; leave
+        # the default in place rather than swallowing the signal.
+        if not callable(previous):
+            continue
+
+        def handler(signum, frame, _previous=previous):
+            SHUTTING_DOWN.set()
+            _previous(signum, frame)
+
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):  # not the main thread
+            continue
 
 
 @asynccontextmanager
@@ -35,6 +66,7 @@ async def lifespan(app: FastAPI):
         db.close()
     init_manager()
     start_scheduler()
+    _install_shutdown_signal_handlers()
     try:
         yield
     finally:
