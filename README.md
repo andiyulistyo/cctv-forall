@@ -47,6 +47,254 @@ Setiap source berjalan di **proses terpisah** (mendukung 4–10 stream). Worker:
 baca frame → YOLO deteksi + ByteTrack → line counting → ANPR → simpan ke DB →
 publish frame beranotasi (JPEG) ke shared state untuk streaming MJPEG.
 
+## Kebutuhan Hardware
+
+Angka di bawah bukan spesifikasi generik: semuanya mengikuti jalur akselerasi
+yang **benar-benar dipakai library proyek ini** — torch, OpenVINO, ONNX Runtime,
+EasyOCR. Yang bertanda **(terukur)** berasal dari `scripts/benchmark.py` di mesin
+nyata; yang bertanda *(ekstrapolasi)* dihitung dari angka tersebut, bukan diukur
+langsung. Pembahasan lengkapnya ada di
+[docs/ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-rekomendasi-hardware).
+
+### Seberapa berat "full feature"?
+
+Full feature = semuanya menyala bersamaan pada satu stream: deteksi + tracking +
+line counting, ANPR (EasyOCR), face recognition, streaming MJPEG, dan retensi
+SQLite.
+
+| Tahap | Biaya | Catatan |
+| --- | ---: | --- |
+| Deteksi + ByteTrack + line counting | ~11 ms/frame | terukur, 1080p, `imgsz=640` |
+| Face recognition — `cv2.dnn` | 86,9 ms/frame | terukur, 720p berisi 5 wajah |
+| Face recognition — ONNX Runtime CPU | 61,8 ms/frame | default `FACE_BACKEND=auto` tanpa GPU |
+| Face recognition — ONNX Runtime CUDA | 16,0 ms/frame | terukur, butuh GPU NVIDIA |
+| ANPR (EasyOCR + detektor plat) | hanya saat ada kandidat plat di zona baca | torch — cepat hanya di CUDA/MPS |
+
+Tiga fakta yang sebenarnya menentukan pilihan hardware:
+
+1. **Begitu `FACE_ENABLED=true`, face recognition-lah tagihan terbesar** —
+   sekitar **8× biaya deteksi kendaraan** kalau berjalan di CPU. Menghitung
+   kendaraan saja jauh lebih murah daripada full feature.
+2. **Jumlah stream dibatasi VRAM, bukan kecepatan GPU.** Arsitekturnya satu
+   proses per source, dan tiap proses membawa konteks CUDA sendiri: **1166 MiB
+   sebelum model apa pun di-load** (terukur), sementara modelnya hanya ~300 MB.
+3. **Dari ~11 ms per frame, cuma ~4 ms yang benar-benar inferensi.** Sisanya
+   letterbox, NMS, dan overhead Python — semuanya di CPU. Karena itu CPU lemah
+   tetap jadi rem walau GPU-nya kencang.
+
+> ⚠️ **EasyOCR dan face recognition hanya ikut terakselerasi di jalur NVIDIA
+> (CUDA) dan Apple (MPS).** Di jalur OpenVINO — yaitu **semua** mesin Intel dan
+> **semua** mesin AMD — yang pindah ke akselerator hanya deteksi kendaraan;
+> OCR plat dan pengenalan wajah tetap jalan di CPU. Itu sebabnya "full feature
+> tanpa GPU NVIDIA" menuntut CPU yang jauh lebih kuat daripada sekadar
+> menghitung kendaraan.
+
+### Minimum untuk menjalankan
+
+| Skenario | CPU | RAM | Akselerator | Disk | Setelan kunci |
+| --- | --- | --- | --- | --- | --- |
+| **Minimum absolut** — 1 stream, semua fitur nyala | 4 core **fisik** dengan AVX2 | 8 GB | tidak wajib | 20 GB SSD | `yolo11n` INT8, imgsz 480–640, `FRAME_STRIDE=3` |
+| **Batas bawah yang sudah diuji** — 1–2 stream | Core i7 gen-7 (2C/4T) *(terukur)* | 8 GB | iGPU Intel Gen9 (`intel:gpu`) | 20 GB SSD | `yolo11n` FP16, imgsz 480 |
+| 4 stream, tanpa GPU diskrit | 8 core fisik Zen 4 / Intel setara | 16 GB | plugin CPU OpenVINO | 128 GB SSD | `yolo11n` INT8, `FRAME_STRIDE=2`, `EXPECTED_STREAMS=4` |
+| 4–10 stream, hemat daya | Apple M4 / M4 Pro *(terukur)* | 16–24 GB unified | `mps` atau CoreML/ANE | 256 GB SSD | `yolo11s`, `FRAME_STRIDE=2`, VideoToolbox |
+| **2–4 stream, full feature nonstop** | ≥8 core fisik | 16–32 GB | NVIDIA ≥8 GB | 256 GB SSD | `yolo11m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
+| 6–8 stream, full feature *(ekstrapolasi)* | ≥12 core fisik | 32 GB | NVIDIA 12–16 GB | 512 GB SSD | sama, `EXPECTED_STREAMS` disesuaikan |
+
+Pada baris "minimum absolut", ANPR dan face recognition tetap bisa dinyalakan,
+tetapi face recognition yang akan mendominasi waktu per frame — naikkan
+`FRAME_STRIDE` dan biarkan `FACE_SIGHTING_COOLDOWN_SEC` apa adanya.
+
+### Minimum per CPU
+
+#### Intel
+
+| Tingkat | Prosesor | Alasan |
+| --- | --- | --- |
+| Batas bawah teruji | Core i5/i7 generasi 7 (2C/4T) + HD Graphics | Hanya layak dengan `yolo11n` FP16 imgsz 480 di `intel:gpu`; 2 core terlalu sedikit untuk plugin CPU |
+| Minimum wajar | Core i5 generasi 8–10, **4 core fisik**, AVX2 | 4 core fisik membuat tiap worker punya jatah core yang nyata |
+| Rekomendasi | Core i5-12400 / i5-13400 ke atas (6 P-core) | Cukup untuk 4 stream di plugin CPU OpenVINO |
+| Terbaik tanpa GPU diskrit | Core Ultra 5 / 7 (Meteor–Arrow Lake) | VNNI untuk INT8 + iGPU Arc yang jauh lebih kuat |
+
+- **AVX2 wajib.** CPU tanpa AVX2 (pra-Haswell) tidak layak untuk plugin CPU
+  OpenVINO.
+- **iGPU minimal Gen9** (Skylake ke atas) supaya terdeteksi plugin GPU OpenVINO.
+- Docker Desktop di Windows **tidak bisa** mem-passthrough iGPU — akselerasi
+  Intel hanya lewat instalasi native.
+
+#### AMD
+
+| Tingkat | Prosesor | Alasan |
+| --- | --- | --- |
+| Minimum | Ryzen 5 3600 (Zen 2, 6 core, AVX2) | Cukup untuk 1–2 stream `yolo11n` INT8 |
+| Rekomendasi | **Zen 4 / Zen 5** — Ryzen 5 7600, Ryzen 7 7840U/8845HS | AVX-512 + VNNI: INT8 memberi **2,2×** (33 → 73 fps, terukur) |
+| Pendamping GPU | Ryzen 9 8940HX (16 core) *(terukur)* | Menyuapi RTX tanpa jadi rem |
+
+Terukur di **Ryzen 7 PRO 7840U** (8C/16T, 1080p, `imgsz=640`, deteksi saja):
+`yolo11n` INT8 **73 fps** dengan seluruh CPU, dan **55 fps** saat dipin ke 2 core
+— jatah satu worker pada `EXPECTED_STREAMS=4`. **Angka kedua itulah** yang
+menentukan, karena di produksi tiap worker hanya dapat
+`core_fisik / EXPECTED_STREAMS`.
+
+> Hitung **core fisik**, bukan thread logis. SMT sibling justru membuat worker
+> saling rebutan — `runtime.py` sengaja mengabaikannya.
+
+#### Apple Silicon
+
+| Tingkat | Chip | Alasan |
+| --- | --- | --- |
+| Minimum | M1 / M2, **16 GB** unified | 8 GB terlalu mepet: ±570 MB per stream di luar model |
+| Rekomendasi | **M4 16 GB** | 4–8 stream `yolo11s`, hemat daya, senyap |
+| Banyak stream | **M4 Pro 24 GB** *(terukur)* | 8–10 stream 1080p |
+
+Terukur di **Mac mini M4 Pro** (8P + 4E), 1080p, `imgsz=640`, deteksi saja:
+
+| Model | Perangkat | FPS |
+| --- | --- | ---: |
+| yolo11n | Neural Engine (CoreML) | **113** |
+| yolo11n | GPU (`mps`) | 108 |
+| yolo11s | GPU (`mps`) | 91 |
+| yolo11n | CPU | 40 |
+
+> ⚠️ Di Mac **jalankan native, jangan Docker** — Docker di Mac CPU-only, ±2,7×
+> lebih lambat.
+
+### Minimum per akselerator
+
+#### GPU NVIDIA 🟩 — satu-satunya jalur yang mengakselerasi *semua* fitur
+
+| | Spesifikasi | Catatan |
+| --- | --- | --- |
+| Arsitektur minimum | **Turing** (GTX 16xx / RTX 20xx) | fp16 baru benar-benar cepat sejak Turing; di Pascal (GTX 10xx) fp16 justru lambat |
+| VRAM minimum | **6 GB** | 4 GB tidak disarankan untuk full feature |
+| Rekomendasi | **12–16 GB** | Yang membatasi jumlah stream adalah VRAM, bukan kelas GPU |
+
+Anggaran VRAM per stream — terukur lewat `torch.cuda.mem_get_info()` di RTX 5070
+Laptop:
+
+| Tahap | VRAM |
+| --- | ---: |
+| Konteks CUDA kosong (per proses) | 1166 MiB |
+| + `yolo11m` fp16 | 1330 MiB |
+| + EasyOCR + detektor plat | 1388 MiB |
+| Saat memproses frame | ~1482 MiB |
+
+Anggarkan **±1,5 GB per stream** plus ruang untuk desktop: 8 GB → 2 stream
+lapang atau 4 stream mepet (terukur); 12 GB → ~6 stream; 16 GB → ~8 stream
+*(dua terakhir ekstrapolasi)*. Di atas itu yang dibutuhkan inference server
+bersama, bukan kartu yang lebih besar — konteks CUDA per proses tidak bisa
+ditawar lewat konfigurasi.
+
+Terukur di **RTX 5070 Laptop 8 GB**: `yolo11m` fp16 **90,5 fps**, `yolo11s` fp16
+84,1 fps — versus 43,9 fps di OpenVINO CPU INT8 pada mesin yang sama.
+
+> ⚠️ **Kecocokan wheel torch.** RTX seri 50 adalah sm_120 (Blackwell) dan
+> memerlukan wheel CUDA 13; wheel cu128 ke bawah tidak punya kernel untuknya.
+> Kartu lama tetap didukung wheel yang sama.
+
+#### GPU AMD Radeon 🔴 — **tidak dipakai untuk inferensi**
+
+Ini bukan kelalaian, melainkan hasil pengecekan:
+
+- Plugin GPU OpenVINO **hanya mendukung GPU Intel** — di Ryzen 7 PRO 7840U,
+  `Core().available_devices` memang hanya melaporkan `CPU`; Radeon 780M tidak
+  muncul sama sekali.
+- Jalur **DirectML** butuh backend ONNX kustom: ultralytics tidak pernah
+  mendaftarkan `DmlExecutionProvider`.
+- **ROCm** untuk torch tidak tersedia di Windows, dan di Linux hanya mendukung
+  sebagian kartu.
+
+Artinya Radeon — baik iGPU 780M maupun RX diskrit — hanya membantu **decode
+video** (D3D11VA/VAAPI), bukan inferensi. **Pada mesin AMD, alokasikan anggaran
+ke CPU (Zen 4/Zen 5 dengan AVX-512 VNNI), bukan ke kartu Radeon.** Plugin CPU
+dengan INT8 sudah memberi 2,2×, dan itu jalur yang cepat, membosankan, dan
+andal.
+
+#### GPU Intel Arc / iGPU 🔵
+
+- iGPU Intel **Gen9 ke atas** terdeteksi sebagai device `GPU` oleh OpenVINO dan
+  dipilih otomatis (`intel:gpu`) saat `YOLO_MODEL` menunjuk ke direktori
+  `*_openvino_model`.
+- **Arc A-series / B-series** dan iGPU Arc pada Core Ultra memakai plugin yang
+  sama, jadi secara teknis berlaku — tetapi **belum diukur di proyek ini**.
+- Ingat batasnya: yang pindah ke Arc hanya deteksi kendaraan. OCR plat dan
+  pengenalan wajah tetap di CPU.
+
+#### Perangkat NPU 🧠
+
+| NPU | Status di proyek ini |
+| --- | --- |
+| **Apple Neural Engine** (M1–M4) | ✅ **Dipakai penuh** — export CoreML lewat `scripts/export_coreml.py`, terukur **113 fps** (`yolo11n`), paling hemat daya sekaligus membebaskan GPU |
+| **Intel AI Boost** (Core Ultra, NPU 3/4) | ⚠️ **Mungkin, belum diuji** — OpenVINO punya plugin NPU, jadi `DEVICE=intel:npu` dengan model `*_openvino_model` masuk akal untuk dicoba. Auto-deteksi proyek ini hanya memilih `intel:gpu` atau `intel:cpu`, jadi harus diset manual lalu diukur sendiri |
+| **AMD Ryzen AI / XDNA** (7040, 8040, AI 300) | ❌ **Tidak ada jalur** — butuh Ryzen AI SW + execution provider Vitis AI yang tidak didaftarkan ultralytics |
+| **Qualcomm Snapdragon X** (Hexagon) | ❌ **Tidak ada jalur** — butuh QNN execution provider; wheel torch/OpenCV untuk Windows-on-ARM juga masih terbatas |
+
+> **Jangan membeli mesin karena angka TOPS NPU-nya**, kecuali Apple. Di luar
+> Apple, NPU yang ada di pasar belum punya jalur yang dipakai proyek ini.
+
+### RAM, storage, dan jaringan
+
+- **RAM: ±570 MB per stream** pada 1080p (terukur di M4 Pro), di luar model.
+  Sumber HLS/YouTube menambah jitter buffer ±83 MB per detik pada 720p, dikali
+  `CAPTURE_BUFFER_SECONDS` (default 2). Sumber RTSP tidak memakai ini.
+- **Disk untuk instalasi (terukur):** venv dengan torch CUDA **4,2 GB**, bobot
+  model ~325 MB, cache EasyOCR ~94 MB. Sediakan **≥20 GB**.
+- **Pertumbuhan data didominasi ANPR.** Tiap plat terbaca menyimpan crop plat
+  (**rata-rata 6,5 KB**, terukur) **dan satu frame penuh** (**rata-rata 1,9 MB**
+  pada campuran 1080p/4K; ±0,4 MB kalau murni 1080p) selama
+  `ALPR_SAVE_FRAME=true`. Perkiraan kasar: 500 pembacaan/hari/stream × 1,9 MB ≈
+  **±950 MB/hari/stream**, jadi dengan `RETENTION_DAYS=7` ≈ **±6,6 GB per
+  stream**. Kalau disk terbatas: matikan `ALPR_SAVE_FRAME` atau turunkan retensi.
+- **SSD wajib** — SQLite berjalan mode WAL.
+- **Jaringan:** RTSP dipaksa lewat TCP (`RTSP_TRANSPORT_TCP=true`) karena UDP
+  menghasilkan jauh lebih banyak frame rusak dari CCTV.
+- **Decoding video** dipindahkan ke media engine lewat `FFMPEG_HWACCEL=auto`
+  (D3D11VA di Windows, VAAPI di Linux, VideoToolbox di macOS) — berlaku di semua
+  tingkatan hardware dan tidak menuntut komponen khusus.
+
+### Rekomendasi & estimasi anggaran 💰
+
+> ⚠️ Harga di bawah adalah **perkiraan kasar pasar Indonesia untuk unit baru
+> (Agustus 2026)**, disediakan supaya Anda bisa menyusun anggaran — bukan
+> kutipan harga. **Belum termasuk kamera, switch/PoE, UPS, dan storage
+> tambahan.** Cek harga terkini sebelum membeli.
+
+| Paket | Cocok untuk | Contoh konfigurasi | Perkiraan |
+| --- | --- | --- | ---: |
+| **A — Coba dulu** | 1–2 stream, fitur boleh dikurangi | PC kantor bekas Core i5 gen 8–10 (4 core fisik), 16 GB, SSD 512 GB | **Rp 2–4 jt** |
+| **B — Tanpa GPU diskrit** | 4 stream, hitung kendaraan + ANPR sesekali | Mini PC Ryzen 7 7840HS / 8845HS (8 core Zen 4), 32 GB, SSD 1 TB | **Rp 9–13 jt** |
+| **C — Hemat daya & senyap** | 4–8 stream, full feature | Mac mini M4 16 GB *(M4 Pro 24 GB untuk 8–10 stream)* | **Rp 10–13 jt** *(M4 Pro: Rp 21–26 jt)* |
+| **D — Full feature + GPU** ⭐ | 2–4 stream, ANPR + wajah nonstop | Ryzen 5 7600 / Core i5-13400F, 32 GB, **RTX 4060 8 GB**, SSD 1 TB | **Rp 15–20 jt** |
+| **E — Banyak stream** | 6–8 stream full feature *(ekstrapolasi)* | Ryzen 7 7700 / Core i5-14600 (≥12 core), 64 GB, **RTX 5060 Ti 16 GB**, SSD 2 TB | **Rp 28–38 jt** |
+
+Cara membacanya:
+
+- **Tanpa face recognition**, paket **B** menangani 4 stream dengan nyaman dan
+  paling murah per stream (±Rp 2,5 jt/stream).
+- **Dengan wajah + ANPR nonstop**, mulai dari paket **D**. Di bawah itu, face
+  recognition (61,8 ms di CPU) yang akan menjadi rem — bukan deteksi kendaraan.
+- **Menambah stream = menambah VRAM, bukan menaikkan kelas GPU.** Pada anggaran
+  yang mirip antara RTX 4060 Ti 8 GB dan RTX 5060 Ti 16 GB, **pilih yang 16 GB**.
+- Biaya per stream: paket D ≈ Rp 5 jt/stream, paket E ≈ Rp 4,5 jt/stream.
+- Paket **C** menang kalau listrik, kebisingan, atau ruang jadi pertimbangan —
+  tapi ingat: harus dijalankan native, bukan Docker.
+
+### Yang tidak perlu dibeli
+
+- **GPU kelas atas demi TensorRT.** Hanya ~4 dari ~11 ms per frame yang berupa
+  inferensi; TensorRT cuma bisa memangkas bagian itu.
+- **Kartu demi NVDEC.** FFmpeg yang dibundel `opencv-python` tidak punya decoder
+  NVDEC sama sekali — D3D11VA sudah menangani decoding.
+- **CPU dengan banyak thread logis tapi sedikit core fisik.** `runtime.py`
+  sengaja menghitung core fisik.
+- **Kartu Radeon untuk inferensi** — lihat bagian GPU AMD di atas.
+- **Mesin karena angka TOPS NPU-nya** (kecuali Apple) — lihat tabel NPU.
+
+Sebelum mengeluarkan uang, ukur di kandidat mesin Anda sendiri:
+
+```bash
+backend/.venv/bin/python scripts/benchmark.py --model data/weights/yolo11s.pt --half
+```
+
 ## Menjalankan dengan Docker (disarankan)
 
 Prasyarat: Docker + Docker Compose.
