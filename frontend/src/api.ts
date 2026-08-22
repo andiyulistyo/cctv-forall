@@ -5,6 +5,15 @@ const BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
 export type SourceType = "youtube" | "rtsp" | "rtmp" | "hls" | "http" | "file";
 export const DETECTION_CLASSES = ["person", "car", "motorcycle", "truck", "bus"] as const;
 export type DetectionClass = (typeof DETECTION_CLASSES)[number];
+/** The classes that can carry a plate -- mirrors models.VEHICLE_CLASSES. */
+export const VEHICLE_CLASSES = ["car", "motorcycle", "truck", "bus"] as const;
+export const CLASS_LABELS: Record<string, string> = {
+  person: "Orang",
+  car: "Mobil",
+  motorcycle: "Motor",
+  truck: "Truk",
+  bus: "Bus",
+};
 
 export interface Source {
   id: number;
@@ -67,6 +76,44 @@ export interface PlateListResponse {
   plates: Plate[];
   /** Total matching the filters, ignoring limit/offset -- drives the page count. */
   total: number;
+  /** Reads per vehicle class under every filter *except* the class one, so the
+   *  class filter can show what each choice would give you. */
+  class_counts: Record<string, number>;
+}
+
+/** Columns the plate list can be ordered by. "source" sorts on the source name. */
+export const PLATE_SORT_KEYS = [
+  "timestamp",
+  "confidence",
+  "plate_text",
+  "vehicle_class",
+  "source",
+] as const;
+export type PlateSortKey = (typeof PLATE_SORT_KEYS)[number];
+
+export interface PlateQuery {
+  source?: number;
+  vehicle_class?: string;
+  /** Part of the plate text. Spaces and dashes are ignored by the server. */
+  q?: string;
+  min_confidence?: number;
+  /** ISO timestamps. Only reads at or after `from`, and at or before `to`. */
+  from?: string;
+  to?: string;
+  sort?: PlateSortKey;
+  order?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+}
+
+/** Drops empty values so an unset filter never reaches the server at all --
+ *  `?source=` would be a validation error, not "every source". */
+function plateQueryString(query: PlateQuery): string {
+  const params = new URLSearchParams();
+  Object.entries(query).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") params.set(k, String(v));
+  });
+  return params.toString();
 }
 
 export interface EnrolledFace {
@@ -157,10 +204,8 @@ export const api = {
     }),
   getCounts: (sourceId?: number) =>
     request<CountsResponse>(`/counts${sourceId ? `?source=${sourceId}` : ""}`),
-  listPlates: (sourceId?: number, limit = 100, offset = 0) =>
-    request<PlateListResponse>(
-      `/plates?limit=${limit}&offset=${offset}${sourceId ? `&source=${sourceId}` : ""}`
-    ),
+  listPlates: (query: PlateQuery = {}) =>
+    request<PlateListResponse>(`/plates?${plateQueryString(query)}`),
 
   // --- Faces ---
   listFaces: () => request<EnrolledFace[]>("/faces"),

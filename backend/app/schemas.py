@@ -152,6 +152,9 @@ class PlateListResponse(BaseModel):
     plates: list[PlateOut]
     # total matching the filters, ignoring limit/offset -- the page count
     total: int
+    # Reads per vehicle class under every filter *except* the class one, so the
+    # class filter can show what each choice would give you.
+    class_counts: dict[str, int] = Field(default_factory=dict)
 
 
 # --- Faces ---

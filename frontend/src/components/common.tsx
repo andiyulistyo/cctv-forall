@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { api, DETECTION_CLASSES, Plate } from "../api";
+import { api, CLASS_LABELS, DETECTION_CLASSES, Plate } from "../api";
 
 const STATUS_STYLES: Record<string, string> = {
   running: "bg-green-500/20 text-green-300 border-green-600",
@@ -25,13 +25,6 @@ export function ClassSelector({
   const toggle = (c: string) => {
     onChange(value.includes(c) ? value.filter((x) => x !== c) : [...value, c]);
   };
-  const LABELS: Record<string, string> = {
-    person: "Orang",
-    car: "Mobil",
-    motorcycle: "Motor",
-    truck: "Truk",
-    bus: "Bus",
-  };
   return (
     <div className="flex flex-wrap gap-2">
       {DETECTION_CLASSES.map((c) => (
@@ -45,7 +38,7 @@ export function ClassSelector({
               : "border-slate-700 text-slate-400"
           }`}
         >
-          {LABELS[c]}
+          {CLASS_LABELS[c]}
         </button>
       ))}
     </div>
