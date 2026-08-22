@@ -12,7 +12,7 @@ import signal
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from statistics import median
 
 import cv2
@@ -42,6 +42,7 @@ from .source_reader import (
     BufferedFrameReader,
     SourceReader,
 )
+from .vehicle_registry import VehicleRegistry
 
 # Per-class BGR colors for drawing.
 _CLASS_COLORS = {
@@ -568,6 +569,9 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             min_vehicle_width=settings.alpr_min_vehicle_width,
             zone=source_cfg.get("alpr_zone"),
             save_frame=settings.alpr_save_frame,
+            stationary_seconds=settings.alpr_stationary_seconds,
+            reid_gap_seconds=settings.alpr_reid_gap_seconds,
+            parked_memory_seconds=settings.alpr_parked_memory_seconds,
         )
 
     stride = max(1, settings.frame_stride)
@@ -738,6 +742,23 @@ _PLATE_QUEUE_SIZE = 8
 # have no usable read yet. Below this we keep trying and keep the best.
 _PLATE_GOOD_ENOUGH_CONF = 0.75
 
+# How much of a vehicle's own size it has to shift before it counts as having
+# moved. Detection boxes jitter by a few percent from frame to frame even on a
+# stationary car; 15% of the box is well clear of that and still far less than
+# any real movement between two detection frames.
+_MOTION_FRACTION = 0.15
+
+# Overlap required before a new track id is taken to be a vehicle we already
+# know. Two vehicles this close to congruent are one vehicle -- a following car
+# in the same lane overlaps far less, and the short re-id window does the rest.
+_REID_IOU = 0.6
+
+# How long an ordinary vehicle is remembered after it was last seen. Only
+# bounds memory -- whether it can still be recognised is decided by the much
+# shorter ALPR_REID_GAP_SECONDS. A vehicle that was parked is kept longer than
+# this instead, for ALPR_PARKED_MEMORY_SECONDS.
+_FORGET_SEC = 60.0
+
 
 def _alpr_classes(configured: str) -> tuple[str, ...]:
     """Parse ALPR_CLASSES into the classes we will attempt plate reads on."""
@@ -768,6 +789,13 @@ class _PlateReader:
     contact point -- the bottom centre of its box -- because that is where the
     vehicle actually is, while the centre of the box floats higher the taller
     the vehicle and would let a bus qualify from a lane away.
+
+    Per-vehicle state -- attempts, best read, the row to correct -- is held by a
+    :class:`VehicleRegistry` rather than keyed on the tracker's id, because a
+    vehicle that stops inside the zone is renumbered by the tracker over and
+    over and would otherwise be treated as a new arrival every time. See
+    ``vehicle_registry`` for why that happens; the consequence here is that a
+    stopped or parked car is read while it arrives and then left alone.
     """
 
     def __init__(
@@ -780,6 +808,9 @@ class _PlateReader:
         min_vehicle_width: int = 0,
         zone: dict | None = None,
         save_frame: bool = False,
+        stationary_seconds: float = 20.0,
+        reid_gap_seconds: float = 4.0,
+        parked_memory_seconds: float = 300.0,
     ):
         self._alpr = alpr
         self._source_id = source_id
@@ -792,20 +823,20 @@ class _PlateReader:
         # Last exception type reported, so a persistent fault is logged once
         # rather than once per vehicle per frame.
         self._last_error: type | None = None
-        # track id -> plate text. Written by the ANPR thread, read by the
-        # detection loop when it draws; a dict assignment is atomic, so the
-        # worst a race can do is draw one frame without the new plate.
+        self._vehicles = VehicleRegistry(
+            reid_gap=reid_gap_seconds,
+            reid_iou=_REID_IOU,
+            stationary_seconds=stationary_seconds,
+            motion_fraction=_MOTION_FRACTION,
+            forget_seconds=_FORGET_SEC,
+            parked_memory=parked_memory_seconds,
+        )
+        # track id -> plate text, rebuilt each frame from the registry. Read by
+        # the detection loop when it draws; rebinding the attribute is atomic,
+        # so the worst a race can do is draw one frame without the new plate.
         self.plates: dict[int, str] = {}
-        # track id -> confidence of the read currently in `plates`. A vehicle is
-        # read several times as it approaches, and the later reads are usually
-        # the better ones, so the first answer must not be the final one.
-        self._best_conf: dict[int, float] = {}
-        # track id -> the PlateRead row we wrote for it, so a better read
-        # corrects that row instead of adding another.
-        self._row_ids: dict[int, int] = {}
-        self._attempts: dict[int, int] = {}
-        # Tracks with a job queued or in progress, so the loop does not pile up
-        # several attempts at one vehicle while the first is still running.
+        # Vehicles with a job queued or in progress, so the loop does not pile
+        # up several attempts at one vehicle while the first is still running.
         self._pending: set[int] = set()
         self._queue: queue.Queue = queue.Queue(maxsize=_PLATE_QUEUE_SIZE)
         self._thread = threading.Thread(target=self._run, name="alpr", daemon=True)
@@ -818,21 +849,28 @@ class _PlateReader:
         and ``scale`` maps detection boxes from the downscaled detection frame
         onto it.
         """
+        now = time.monotonic()
         for det in detections:
             if det.class_name not in self._classes:
                 continue
-            tid = det.track_id
-            if tid in self._pending:
-                continue
-            if self._best_conf.get(tid, 0.0) >= _PLATE_GOOD_ENOUGH_CONF:
-                continue  # already read well; spend the budget elsewhere
-            attempts = self._attempts.get(tid, 0)
-            if attempts >= self._max_attempts:
-                continue  # give up after several tries
 
             box = det.scaled(scale)
             x1, y1 = max(0, int(box.x1)), max(0, int(box.y1))
             x2, y2 = int(box.x2), int(box.y2)
+            # Registered before any of the skips below: the registry has to see
+            # every frame of a vehicle to know whether it is moving, and a
+            # vehicle that is skipped for being too small or out of zone is
+            # exactly the one that will later be judged on that.
+            vehicle = self._vehicles.observe(det.track_id, (x1, y1, x2, y2), now)
+
+            if vehicle.vid in self._pending:
+                continue
+            if vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
+                continue  # already read well; spend the budget elsewhere
+            attempts = vehicle.attempts
+            if attempts >= self._max_attempts:
+                continue  # give up after several tries
+
             if x2 - x1 < self._min_vehicle_width:
                 # Still too far away to carry plate detail. Deliberately before
                 # the attempt is counted: the budget exists for the frames where
@@ -841,9 +879,16 @@ class _PlateReader:
                 continue
             if not self._in_zone(frame, x1, x2, y2):
                 continue  # outside the user's read zone; costs no attempt
+            if self._vehicles.is_parked(vehicle, now):
+                # Stopped or parked inside the read zone. It was read on the way
+                # in, when it was moving; re-reading it now cannot produce a
+                # different vehicle, only a different guess at the same plate --
+                # which is precisely how one parked car ends up filling the
+                # list. Costs no attempt, so it resumes if it pulls away.
+                continue
 
-            self._attempts[tid] = attempts + 1
-            # Attempt at most every few frames per track.
+            vehicle.attempts = attempts + 1
+            # Attempt at most every few frames per vehicle.
             if attempts % self._attempt_interval != 0:
                 continue
 
@@ -858,7 +903,16 @@ class _PlateReader:
             else:
                 snapshot = None
                 crop = frame[y1:y2, x1:x2].copy()
-            self._offer(tid, (tid, det.class_name, crop, snapshot, (x1, y1, x2, y2)))
+            self._offer(
+                vehicle.vid,
+                (vehicle.vid, det.track_id, det.class_name, crop, snapshot,
+                 (x1, y1, x2, y2)),
+            )
+
+        # Labels follow the vehicle, not the id it happens to carry: a
+        # renumbered car keeps the plate already read from it on screen.
+        self.plates = self._vehicles.labels()
+        self._vehicles.prune(now)
 
     def _in_zone(self, frame, x1: int, x2: int, y2: int) -> bool:
         """Is the vehicle's ground contact point inside the read zone?"""
@@ -870,11 +924,11 @@ class _PlateReader:
         zx1, zy1, zx2, zy2 = zone
         return zx1 <= (x1 + x2) / 2.0 <= zx2 and zy1 <= y2 <= zy2
 
-    def _offer(self, tid: int, job: tuple) -> None:
+    def _offer(self, vid: int, job: tuple) -> None:
         # Marked pending before the put, not after: the thread can finish the
         # job -- and clear the mark -- before this call returns, and setting it
-        # afterwards would leave the track pending for good.
-        self._pending.add(tid)
+        # afterwards would leave the vehicle pending for good.
+        self._pending.add(vid)
         while True:
             try:
                 self._queue.put_nowait(job)
@@ -882,7 +936,7 @@ class _PlateReader:
             except queue.Full:
                 try:
                     stale = self._queue.get_nowait()[0]
-                    if stale != tid:
+                    if stale != vid:
                         self._pending.discard(stale)
                 except queue.Empty:
                     pass
@@ -892,24 +946,25 @@ class _PlateReader:
             job = self._queue.get()
             if job is None:  # shutdown
                 return
-            tid, class_name, crop, snapshot, box = job
+            vid, tid, class_name, crop, snapshot, box = job
             try:
                 result = self._alpr.read_plate(crop)
-                if result is not None:
+                vehicle = self._vehicles.get(vid)
+                if result is not None and vehicle is not None:
                     text, conf, plate_img = result
                     # Only an improvement replaces what we already have: a
                     # confident read from close up must not be overwritten by a
                     # marginal one from the next frame.
-                    if conf > self._best_conf.get(tid, 0.0):
-                        self._best_conf[tid] = conf
-                        self.plates[tid] = text
+                    if conf > vehicle.best_conf:
+                        vehicle.best_conf = conf
+                        vehicle.text = text
                         row_id = _persist_plate(
                             self._source_id, tid, class_name, text, conf, plate_img,
                             snapshot=snapshot, box=box,
-                            row_id=self._row_ids.get(tid),
+                            row_id=vehicle.row_id,
                         )
                         if row_id is not None:
-                            self._row_ids[tid] = row_id
+                            vehicle.row_id = row_id
             except Exception as exc:
                 # A failed read is not worth losing the thread over: the vehicle
                 # keeps its attempt budget and gets another frame. It is worth
@@ -920,7 +975,7 @@ class _PlateReader:
                     self._last_error = type(exc)
                     print(f"[ALPR] plate read failed: {type(exc).__name__}: {exc}")
             finally:
-                self._pending.discard(tid)
+                self._pending.discard(vid)
 
     def close(self) -> None:
         # Drop the backlog first, so the sentinel always fits.
@@ -980,6 +1035,31 @@ def _write_evidence_frame(
     return _write_image(settings.frames_dir, filename, snapshot)
 
 
+def _recent_duplicate(db, source_id: int, text: str) -> PlateRead | None:
+    """The row this read is a repeat of, if the text-level window is enabled.
+
+    Off by default. It is the blunt half of duplicate suppression: it catches
+    the same plate recorded twice however that happened, but only when OCR read
+    it *identically* both times -- and a plate read at low confidence rarely is.
+    The vehicle-level suppression in :class:`VehicleRegistry` is what actually
+    stops a parked car repeating; this only tidies up behind it.
+    """
+    window = settings.alpr_duplicate_window_seconds
+    if window <= 0:
+        return None
+    cutoff = _now() - timedelta(seconds=window)
+    return db.scalars(
+        select(PlateRead)
+        .where(
+            PlateRead.source_id == source_id,
+            PlateRead.plate_text == text,
+            PlateRead.timestamp >= cutoff,
+        )
+        .order_by(PlateRead.timestamp.desc())
+        .limit(1)
+    ).first()
+
+
 def _persist_plate(
     source_id, track_id, vehicle_class, text, conf, plate_img: np.ndarray,
     snapshot: np.ndarray | None = None,
@@ -1016,6 +1096,18 @@ def _persist_plate(
     db = SessionLocal()
     try:
         row = db.get(PlateRead, row_id) if row_id is not None else None
+        if row is None:
+            # No row of our own yet: with ALPR_DUPLICATE_WINDOW_SECONDS set,
+            # one already recorded for this plate on this camera counts as ours.
+            row = _recent_duplicate(db, source_id, text)
+            if row is not None and row.confidence >= conf:
+                # ...and it is the better read of the two, so it stands as it is
+                # and the images just written for this one are the redundant
+                # pair. (db.close() still runs; only the discard loop at the end
+                # is skipped, and it is done here instead.)
+                for path in (image_path, frame_path):
+                    _discard_plate_image(path)
+                return row.id
         if row is None:
             row = PlateRead(
                 source_id=source_id,

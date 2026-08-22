@@ -173,6 +173,46 @@ class Settings(BaseSettings):
     # Frames below the threshold cost no attempt, so the budget survives for
     # where it can work.
     alpr_min_vehicle_width: int = 160
+    # --- Duplicate suppression ---
+    #
+    # A vehicle that stops inside the read zone -- waiting at a gate, or parked
+    # in shot all evening -- is the one case where the attempt budget does not
+    # end the reading. The tracker keeps losing a motionless vehicle and giving
+    # it a new id, and a new id used to mean a new budget and a new row, so one
+    # parked car filled the plate list with a fresh (differently misread) entry
+    # every few minutes.
+    #
+    # How long a vehicle must hold still before it is treated as stopped and
+    # left alone. It is still read on the way in, while it is moving; only the
+    # endless re-reading afterwards is dropped. It resumes the moment the
+    # vehicle pulls away. 0 disables the check -- reasonable only where nothing
+    # ever stops in the zone.
+    alpr_stationary_seconds: float = 20.0
+    # How long a vehicle may be missing before a box appearing in the same place
+    # counts as a *different* vehicle rather than the same one renumbered. This
+    # is the whole safety margin: a tracker blink lasts a frame or two, whereas
+    # one car leaving and the next pulling into the same spot takes far longer.
+    # Raise it if a parked car still slips through as new; lower it if two cars
+    # queueing in the same spot get merged into one row. 0 disables re-id, which
+    # brings back the duplicates.
+    alpr_reid_gap_seconds: float = 4.0
+    # How long a vehicle already established as parked stays recognisable after
+    # the detector stops seeing it at all. A motionless car does not just get
+    # renumbered, it disappears: a static shape against a static background
+    # drops below the confidence threshold and comes back minutes later, which
+    # is why the reads in the reported case were 2-4 minutes apart. Without this
+    # every reappearance is a new arrival. It only applies to vehicles that had
+    # already held still for ALPR_STATIONARY_SECONDS, so a car pausing at a gate
+    # is unaffected. Lower it where parking spots turn over quickly.
+    alpr_parked_memory_seconds: float = 300.0
+    # Optional second net, on the text rather than the vehicle: within this many
+    # seconds, a read whose plate string already exists for the same source
+    # updates that row instead of adding one. Off by default, because it also
+    # merges a vehicle genuinely passing twice in quick succession, and because
+    # OCR that misreads the same plate differently each time (the usual case at
+    # low confidence) slips straight through it. Useful on a gate camera where
+    # every duplicate matters more than every distinct pass.
+    alpr_duplicate_window_seconds: float = 0.0
     # Save the full frame alongside the plate crop, with the vehicle boxed.
     # The crop proves the characters; only the frame shows what they were
     # attached to, which is what makes a read verifiable by a person. Costs one

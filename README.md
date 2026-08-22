@@ -502,6 +502,10 @@ memang bisa berhasil.
 | `ALPR_CLASSES` | `car,truck,bus` | kelas yang platnya dibaca; motor sengaja tidak termasuk |
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
 | `ALPR_SAVE_FRAME` | true | simpan 1 frame penuh (kendaraan dikotaki) per plat terbaca |
+| `ALPR_STATIONARY_SECONDS` | 20 | kendaraan yang diam selama ini dianggap berhenti/parkir dan berhenti dibaca (0 = matikan) |
+| `ALPR_REID_GAP_SECONDS` | 4 | selisih waktu maksimum sebelum box di tempat yang sama dianggap kendaraan **lain** (0 = matikan re-id) |
+| `ALPR_PARKED_MEMORY_SECONDS` | 300 | berapa lama kendaraan yang sudah berstatus parkir tetap dikenali setelah hilang dari deteksi |
+| `ALPR_DUPLICATE_WINDOW_SECONDS` | 0 | opsional: teks plat yang sama pada kamera yang sama dalam N detik memperbarui baris lama, bukan menambah baris (0 = mati) |
 | `FACE_ENABLED` | true | aktif/nonaktif face recognition global |
 | `FACE_SIMILARITY_THRESHOLD` | 0.363 | ambang cosine SFace (lebih tinggi = lebih ketat) |
 | `FACE_BACKEND` | `auto` | `onnx` (GPU, cepat) / `opencv` / `auto`; ganti = wajib daftar ulang wajah |
@@ -609,6 +613,19 @@ Beberapa hal yang perlu diketahui:
   memperbarui baris yang sama (bukan menambah baris baru), dan crop lamanya
   dihapus. Tanpa ini, salah baca confidence 0.2 dari kejauhan terkunci permanen
   dan memblokir bacaan bagus yang datang dua detik kemudian di depan kamera.
+- **Kendaraan yang berhenti dibaca sekali, bukan terus-menerus.** Semua logika
+  "satu kendaraan = satu baris" di atas bertumpu pada track id, padahal track id
+  bukan identitas: ByteTrack membuang track kendaraan yang **tidak bergerak**
+  (bentuk diam di latar diam pelan-pelan turun di bawah ambang confidence) lalu
+  memberinya nomor baru saat terdeteksi lagi. Nomor baru = jatah percobaan baru
+  = baris baru, jadi satu mobil parkir di zona baca memenuhi daftar plat: baris
+  baru tiap beberapa menit, masing-masing dengan tebakan OCR yang berbeda untuk
+  plat yang sama. `vehicle_registry.py` memasang identitas kendaraan di atas
+  track id — box yang muncul di tempat kendaraan yang barusan ada di situ
+  *adalah* kendaraan itu, lengkap dengan jatah, bacaan terbaik, dan barisnya —
+  dan menandai kendaraan yang diam >`ALPR_STATIONARY_SECONDS` sebagai berhenti
+  sehingga tidak dibaca ulang sampai ia jalan lagi. Mobil yang cuma berhenti
+  sebentar di portal tidak kena: ambang parkirnya belum tercapai.
 - **YouTube live sering tersendat dari sananya.** Diukur pada stream CCTV live
   (hanya tersedia HLS): tanpa deteksi sama sekali, hanya decoding, tetap ada
   11–12 jeda >0.5 detik per 75 detik dengan jeda terpanjang **14 detik** — sama

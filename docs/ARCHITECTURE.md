@@ -439,6 +439,7 @@ flowchart LR
             WK["worker.py — loop per source"]
             DT["detector.py — YOLO + ByteTrack"]
             AL["alpr.py — plat + EasyOCR"]
+            VR["vehicle_registry.py — identitas kendaraan · anti-duplikat"]
             FC["face.py — YuNet + SFace"]
             OF["onnx_face.py — backend ONNX Runtime"]
             LN["line_counter.py — crossing + histeresis"]
@@ -452,6 +453,7 @@ flowchart LR
     apis --> MG --> WK
     WK --> DT
     WK --> AL
+    WK --> VR
     WK --> FC
     WK --> LN
     WK --> SRD
