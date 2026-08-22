@@ -63,6 +63,12 @@ export interface Plate {
   timestamp: string;
 }
 
+export interface PlateListResponse {
+  plates: Plate[];
+  /** Total matching the filters, ignoring limit/offset -- drives the page count. */
+  total: number;
+}
+
 export interface EnrolledFace {
   id: number;
   name: string;
@@ -151,8 +157,10 @@ export const api = {
     }),
   getCounts: (sourceId?: number) =>
     request<CountsResponse>(`/counts${sourceId ? `?source=${sourceId}` : ""}`),
-  listPlates: (sourceId?: number, limit = 100) =>
-    request<Plate[]>(`/plates?limit=${limit}${sourceId ? `&source=${sourceId}` : ""}`),
+  listPlates: (sourceId?: number, limit = 100, offset = 0) =>
+    request<PlateListResponse>(
+      `/plates?limit=${limit}&offset=${offset}${sourceId ? `&source=${sourceId}` : ""}`
+    ),
 
   // --- Faces ---
   listFaces: () => request<EnrolledFace[]>("/faces"),

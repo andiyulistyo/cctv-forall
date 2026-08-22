@@ -27,7 +27,7 @@ export default function SourceDetail() {
     const load = async () => {
       try {
         setCounts(await api.getCounts(sourceId));
-        setPlates(await api.listPlates(sourceId, 20));
+        setPlates((await api.listPlates(sourceId, 10)).plates);
         setSightings(await api.listSightings(sourceId, 20));
         setSource(await api.getSource(sourceId));
       } catch {

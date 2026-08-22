@@ -5,49 +5,66 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user, validate_token
 from ..config import settings
 from ..database import get_db
 from ..models import PlateRead
-from ..schemas import PlateOut
+from ..schemas import PlateListResponse, PlateOut
 
 router = APIRouter(prefix="/plates", tags=["plates"])
 
 
-@router.get("", response_model=list[PlateOut], dependencies=[Depends(get_current_user)])
+@router.get("", response_model=PlateListResponse, dependencies=[Depends(get_current_user)])
 def list_plates(
     source: int | None = Query(None),
     from_: datetime | None = Query(None, alias="from"),
     to: datetime | None = Query(None),
     limit: int = Query(100, le=1000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> list[PlateOut]:
-    stmt = select(PlateRead).order_by(PlateRead.timestamp.desc()).limit(limit)
+) -> PlateListResponse:
+    filters = []
     if source is not None:
-        stmt = stmt.where(PlateRead.source_id == source)
+        filters.append(PlateRead.source_id == source)
     if from_ is not None:
-        stmt = stmt.where(PlateRead.timestamp >= from_)
+        filters.append(PlateRead.timestamp >= from_)
     if to is not None:
-        stmt = stmt.where(PlateRead.timestamp <= to)
+        filters.append(PlateRead.timestamp <= to)
+
+    # The caller needs the unpaged total to know how many pages there are.
+    total = db.scalar(select(func.count()).select_from(PlateRead).where(*filters)) or 0
+
+    # id breaks ties: two reads can share a timestamp, and without a stable
+    # second key the same row could show up on two pages (or on none).
+    stmt = (
+        select(PlateRead)
+        .where(*filters)
+        .order_by(PlateRead.timestamp.desc(), PlateRead.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
 
     rows = db.scalars(stmt).all()
-    return [
-        PlateOut(
-            id=p.id,
-            source_id=p.source_id,
-            track_id=p.track_id,
-            vehicle_class=p.vehicle_class,
-            plate_text=p.plate_text,
-            confidence=p.confidence,
-            has_image=bool(p.image_path),
-            has_frame=bool(p.frame_path),
-            timestamp=p.timestamp,
-        )
-        for p in rows
-    ]
+    return PlateListResponse(
+        plates=[
+            PlateOut(
+                id=p.id,
+                source_id=p.source_id,
+                track_id=p.track_id,
+                vehicle_class=p.vehicle_class,
+                plate_text=p.plate_text,
+                confidence=p.confidence,
+                has_image=bool(p.image_path),
+                has_frame=bool(p.frame_path),
+                timestamp=p.timestamp,
+            )
+            for p in rows
+        ],
+        total=total,
+    )
 
 
 def _serve(rel_path: str | None, missing: str) -> FileResponse:

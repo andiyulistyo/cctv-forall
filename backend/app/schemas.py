@@ -148,6 +148,12 @@ class PlateOut(BaseModel):
         return _as_utc_iso(v)
 
 
+class PlateListResponse(BaseModel):
+    plates: list[PlateOut]
+    # total matching the filters, ignoring limit/offset -- the page count
+    total: int
+
+
 # --- Faces ---
 class EnrolledFaceOut(BaseModel):
     id: int
