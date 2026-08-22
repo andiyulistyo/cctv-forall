@@ -14,7 +14,7 @@ from .config import settings
 from .database import SessionLocal
 from .models import User
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
 
 def hash_password(password: str) -> str:

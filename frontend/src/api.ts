@@ -1,6 +1,10 @@
 // API client. In production the SPA is same-origin with the backend, so the
-// base is empty. Override with VITE_API_BASE if needed.
-const BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
+// origin is empty. Override with VITE_API_BASE if the backend lives elsewhere.
+const ORIGIN = (import.meta as any).env?.VITE_API_BASE ?? "";
+// Every endpoint sits under /api so that page routes like /plates and /faces
+// stay the SPA's -- they used to be claimed by the API, which made those pages
+// impossible to open or refresh directly.
+const BASE = `${ORIGIN}/api`;
 
 export type SourceType = "youtube" | "rtsp" | "rtmp" | "hls" | "http" | "file";
 export const DETECTION_CLASSES = ["person", "car", "motorcycle", "truck", "bus"] as const;

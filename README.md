@@ -813,7 +813,7 @@ letak masalahnya:
 | `tampil` jauh di bawah `masuk` | batas `MJPEG_FPS` | naikkan `MJPEG_FPS` (ideal ≥ fps kamera) |
 | `tampil` normal tapi `deteksi` sangat rendah | preview tetap live, yang tersendat inference/OCR | lihat catatan ANPR — turunkan `ALPR_MAX_ATTEMPTS`, naikkan `ALPR_ATTEMPT_INTERVAL`, atau pindahkan OCR ke CPU |
 
-Lewat API: `curl -s localhost:8000/sources -H "authorization: Bearer <token>"`.
+Lewat API: `curl -s localhost:8000/api/sources -H "authorization: Bearer <token>"`.
 
 Beberapa hal yang perlu diketahui:
 

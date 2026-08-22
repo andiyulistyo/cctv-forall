@@ -5,7 +5,7 @@ import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -119,12 +119,31 @@ def health():
     }
 
 
-app.include_router(auth_routes.router)
-app.include_router(sources.router)
-app.include_router(streams.router)
-app.include_router(counts.router)
-app.include_router(plates.router)
-app.include_router(faces.router)
+# Everything the API serves lives under /api, which keeps it out of the way of
+# the SPA's own routes. Without the prefix, "/plates" and "/faces" were claimed
+# by the API -- so opening or refreshing one of those pages in the browser
+# answered with a 401 JSON body instead of the app, and a link to a filtered
+# view could not be shared at all.
+for _router in (
+    auth_routes.router,
+    sources.router,
+    streams.router,
+    counts.router,
+    plates.router,
+    faces.router,
+):
+    app.include_router(_router, prefix="/api")
+
+
+@app.api_route("/api/{rest:path}", include_in_schema=False)
+def unknown_api_route(rest: str):
+    """A mistyped endpoint should say so.
+
+    The SPA is mounted as a catch-all below, so without this an unknown /api
+    path would fall through and return index.html with a cheerful 200 -- which
+    reads like a broken frontend rather than a wrong URL.
+    """
+    raise HTTPException(404, f"No such API endpoint: /api/{rest}")
 
 
 class SPAStaticFiles(StaticFiles):
