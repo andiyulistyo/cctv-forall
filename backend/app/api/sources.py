@@ -1,4 +1,4 @@
-"""Source CRUD + lifecycle (start/stop), snapshot and line configuration."""
+"""Source CRUD + lifecycle (start/stop), snapshot, counting line and ANPR zone."""
 from __future__ import annotations
 
 import cv2
@@ -17,6 +17,7 @@ from ..schemas import (
     SourceListResponse,
     SourceOut,
     SourceUpdate,
+    ZoneUpdate,
 )
 
 router = APIRouter(prefix="/sources", tags=["sources"], dependencies=[Depends(get_current_user)])
@@ -31,6 +32,7 @@ def build_source_cfg(src: Source) -> dict:
         "url": src.url,
         "enabled_classes": list(src.enabled_classes or []),
         "line": src.line,
+        "alpr_zone": src.alpr_zone,
         "direction_labels": src.direction_labels or {"in": "in", "out": "out"},
         "alpr_enabled": bool(src.alpr_enabled),
         "face_enabled": bool(src.face_enabled),
@@ -138,6 +140,28 @@ def set_line(source_id: int, payload: LineUpdate, db: Session = Depends(get_db))
     db.commit()
     db.refresh(src)
     # Restart the worker so the new line takes effect immediately.
+    mgr = get_manager()
+    if mgr.is_running(source_id):
+        mgr.stop(source_id)
+        mgr.start(build_source_cfg(src))
+    return _to_out(src, mgr)
+
+
+@router.put("/{source_id}/alpr-zone", response_model=SourceOut)
+def set_alpr_zone(
+    source_id: int, payload: ZoneUpdate, db: Session = Depends(get_db)
+) -> SourceOut:
+    """Set (or clear, with ``{"zone": null}``) the plate-reading zone."""
+    src = db.get(Source, source_id)
+    if not src:
+        raise HTTPException(404, "Source not found")
+    src.alpr_zone = (
+        {"a": payload.zone.a, "b": payload.zone.b} if payload.zone is not None else None
+    )
+    db.commit()
+    db.refresh(src)
+    # Restart the worker so the new zone takes effect immediately -- same as
+    # the counting line: it is read once when the worker builds its pipeline.
     mgr = get_manager()
     if mgr.is_running(source_id):
         mgr.stop(source_id)

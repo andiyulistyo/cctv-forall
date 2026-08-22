@@ -9,6 +9,9 @@ Picks the fastest device available for the weights it is given:
   present, otherwise on the OpenVINO CPU plugin — see
   ``scripts/export_openvino.py``. The CPU plugin is vendor-neutral and is the
   fast path on AMD as well, where it uses AVX-512/VNNI on Zen 4.
+* ``*.engine`` (TensorRT) runs on the NVIDIA GPU it was built for — see
+  ``scripts/export_tensorrt.py``. Precision is baked in at build time.
+* ``*.onnx`` runs on ONNX Runtime, which picks its own provider.
 
 Everything else in the app asks :func:`plan_inference` rather than working this
 out again: the worker needs it for its thread budget and /api/health reports it.
@@ -33,9 +36,15 @@ COCO_ID_TO_NAME = {
 NAME_TO_COCO_ID = {v: k for k, v in COCO_ID_TO_NAME.items()}
 
 # Model formats that are not plain PyTorch weights and therefore run through
-# their own runtime (CoreML on the ANE/GPU, OpenVINO, ONNX Runtime, ...) rather
-# than on a torch device.
-_NON_TORCH_SUFFIXES = (".mlpackage", ".mlmodel", ".onnx", ".engine", ".tflite", ".xml")
+# their own runtime (CoreML on the ANE/GPU, OpenVINO, TensorRT, ONNX Runtime,
+# ...) rather than on a torch device. Grouped by runtime, because each one
+# resolves to a different device and a different thread budget.
+_COREML_SUFFIXES = (".mlpackage", ".mlmodel")
+_TENSORRT_SUFFIXES = (".engine",)
+_ONNX_SUFFIXES = (".onnx",)
+_NON_TORCH_SUFFIXES = (
+    _COREML_SUFFIXES + _TENSORRT_SUFFIXES + _ONNX_SUFFIXES + (".tflite", ".xml")
+)
 
 # Ultralytics writes its OpenVINO IR into a directory with this suffix.
 _OPENVINO_DIR_SUFFIX = "_openvino_model"
@@ -81,12 +90,56 @@ def pick_device(preferred: str = "", model_path: str = "") -> str:
     return "cpu"
 
 
+def _is_cuda_device(device: str) -> bool:
+    """True for the device strings that mean "an NVIDIA GPU".
+
+    ultralytics accepts a bare index ("0") as well as "cuda" / "cuda:1".
+    """
+    d = (device or "").strip().lower()
+    return d.startswith("cuda") or d.isdigit()
+
+
+def _torch_version() -> str:
+    """Installed torch build, for error messages. "+cpu" is the usual culprit."""
+    try:
+        import torch
+
+        return f"torch {torch.__version__}"
+    except Exception:
+        return "torch not installed"
+
+
+def require_device(device: str) -> None:
+    """Fail early, and in plain language, when a device cannot be used.
+
+    Called at model-load time rather than from :func:`plan_inference`: planning
+    has to stay pure so /api/health can report a configuration without raising,
+    and so the tuning tests can run with no torch installed at all.
+
+    Without this a CPU-only torch wheel plus ``DEVICE=cuda`` surfaces as an
+    assertion from deep inside ultralytics that says nothing about the cause.
+    """
+    if _is_cuda_device(device) and not runtime.has_cuda():
+        raise RuntimeError(
+            f"DEVICE={device!r} needs a CUDA build of torch, but the installed "
+            f"one ({_torch_version()}) reports no GPU. Install the matching "
+            f"wheel, e.g.:\n"
+            f"  pip install --force-reinstall torch torchvision "
+            f"--index-url https://download.pytorch.org/whl/cu130\n"
+            f"(RTX 50-series is sm_120 and needs CUDA 12.8 or newer.)"
+        )
+    if device.strip().lower() == "mps" and not runtime.has_mps():
+        raise RuntimeError(
+            "DEVICE='mps' needs Apple Silicon with a Metal-capable torch build."
+        )
+
+
 @dataclass(frozen=True)
 class InferencePlan:
     """How a given model/device setting will actually be executed."""
 
     device: str      # cpu | cuda | mps | intel:cpu | intel:gpu
-    backend: str     # torch | coreml | openvino
+    backend: str     # torch | coreml | openvino | tensorrt | onnx
     cpu_bound: bool  # True => this worker needs a full CPU thread budget
     half: bool
 
@@ -102,14 +155,47 @@ def plan_inference(model_path: str, device_setting: str = "", half: bool = False
         # Precision is baked in at export time; the half flag is meaningless.
         on_gpu = device.startswith("intel:") and device.split(":", 1)[1].lower() != "cpu"
         return InferencePlan(device, "openvino", cpu_bound=not on_gpu, half=False)
+    suffix = Path(model_path).suffix.lower()
+    if suffix in _TENSORRT_SUFFIXES:
+        # An engine is built for one GPU and one precision; ultralytics
+        # dispatches it to cuda itself. Reporting "cpu"/"coreml" here (which is
+        # what the old catch-all did) made /api/health claim the GPU was idle
+        # and handed the worker the wrong thread budget.
+        return InferencePlan(device_setting or "cuda", "tensorrt", cpu_bound=False, half=True)
+    if suffix in _ONNX_SUFFIXES:
+        # ONNX Runtime picks its own execution provider; the device string only
+        # tells us whether this worker still needs a full CPU thread budget.
+        return InferencePlan(device, "onnx", cpu_bound=device == "cpu", half=False)
     if is_non_torch_model(model_path):
-        # CoreML/ONNX bundles carry their own runtime; ultralytics expects
-        # "cpu" here and dispatches to the Neural Engine / GPU itself.
+        # CoreML bundles carry their own runtime; ultralytics expects "cpu"
+        # here and dispatches to the Neural Engine / GPU itself.
         return InferencePlan("cpu", "coreml", cpu_bound=False, half=False)
     # fp16 is a GPU-only win; on CPU it is emulated and slower.
     return InferencePlan(
         device, "torch", cpu_bound=device == "cpu", half=bool(half) and device != "cpu"
     )
+
+
+# CPU threads a worker may use when inference is NOT on its CPU. Two is right
+# for the integrated accelerators, where the CPU is also what feeds them. A
+# discrete NVIDIA card is the exception: it leaves the cores genuinely free,
+# but the worker still resizes, letterboxes, annotates and JPEG-encodes every
+# frame on them, and 2 threads makes that the new bottleneck.
+_DISCRETE_GPU_THREAD_CAP = 4
+_SHARED_GPU_THREAD_CAP = 2
+
+
+def gpu_thread_cap(plan: InferencePlan) -> int:
+    """Thread ceiling for a worker running on ``plan``.
+
+    Shared by the worker and by /api/health so the reported budget is the one
+    actually applied.
+    """
+    if plan.backend == "tensorrt":
+        return _DISCRETE_GPU_THREAD_CAP
+    if plan.backend in ("torch", "onnx") and _is_cuda_device(plan.device):
+        return _DISCRETE_GPU_THREAD_CAP
+    return _SHARED_GPU_THREAD_CAP
 
 
 @dataclass
@@ -125,6 +211,28 @@ class Detection:
     @property
     def centroid(self) -> tuple[float, float]:
         return ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
+
+    @property
+    def ground_point(self) -> tuple[float, float]:
+        """Where the object meets the road: bottom centre of its box.
+
+        This, not the centroid, is what should be tested against a counting
+        line. Two reasons, and both showed up in real data:
+
+        * It is where the vehicle physically *is*. A centroid floats higher the
+          taller the vehicle, so a bus and a motorcycle at the same point on the
+          road cross a line at different moments.
+        * It is the stable edge. ``centroid_y`` is ``(y1 + y2) / 2``, so every
+          wobble of the *top* edge moves it by half as much -- and the top edge
+          is the unreliable one, jumping as the model includes or excludes a
+          cab, a container, a mirror. The wheels stay put.
+
+        Measured on the sample junction feed, crossings exceeded distinct
+        tracks by 18.5% for trucks, 8.5% for cars and 2.4% for motorcycles:
+        ordered exactly by box size, which is the signature of box jitter
+        reaching the counter.
+        """
+        return ((self.x1 + self.x2) / 2.0, self.y2)
 
     def scaled(self, factor: float) -> "Detection":
         """Same detection expressed in a frame scaled by ``factor``."""
@@ -158,6 +266,7 @@ class Detector:
         self.device = self.plan.device
         self.half = self.plan.half
         self.backend = self.plan.backend
+        require_device(self.device)
         self.model = YOLO(model_path)
         self._warmup()
 
@@ -167,16 +276,23 @@ class Detector:
         The first MPS call compiles Metal kernels (and CoreML/OpenVINO load and
         compile the model for the target device), which can take seconds — long
         enough to stall a live stream if it happens on frame one.
+
+        CUDA needs more than one pass: the first call pays context creation and
+        the second is where cuDNN picks its algorithms for this input shape, so
+        a single iteration still leaves the autotune cost on the first real
+        frame.
         """
+        passes = 3 if _is_cuda_device(self.device) or self.backend == "tensorrt" else 1
         try:
             blank = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
-            self.model.predict(
-                blank,
-                imgsz=self.imgsz,
-                device=self.device,
-                half=self.half,
-                verbose=False,
-            )
+            for _ in range(passes):
+                self.model.predict(
+                    blank,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    half=self.half,
+                    verbose=False,
+                )
         except Exception as exc:  # non-fatal: real inference may still work
             print(f"[Detector] warmup skipped: {exc}")
 
@@ -220,12 +336,19 @@ class Detector:
         return detections
 
     def trim_memory(self) -> None:
-        """Release cached GPU memory (MPS grows its cache over long runs)."""
-        if self.device != "mps":
-            return
+        """Release cached GPU memory (the caching allocators grow over long runs).
+
+        Matters most on CUDA with several workers: every source is its own
+        process with its own context and its own allocator, so on an 8 GB card
+        the caches are what decides whether the fourth stream starts or dies
+        out of memory.
+        """
         try:
             import torch
 
-            torch.mps.empty_cache()
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            elif _is_cuda_device(self.device) or self.backend == "tensorrt":
+                torch.cuda.empty_cache()
         except Exception:
             pass

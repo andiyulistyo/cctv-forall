@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,6 +56,19 @@ class Settings(BaseSettings):
     frame_stride: int = 2
     # Run inference in fp16. Free speed-up on MPS/CUDA, ignored on CPU.
     inference_half: bool = False
+    # How far past the counting line, as a fraction of frame height, a vehicle
+    # must travel before that side counts as reached.
+    #
+    # Detection boxes jitter, so without a band an object near the line gets
+    # nudged back and forth across it and is counted every time. Measured on the
+    # sample junction feed, that produced 8.5% more crossings than there were
+    # cars and 18.5% more than there were trucks. Inside the band a vehicle's
+    # side is simply undecided, so jitter registers nothing.
+    #
+    # Keep it small: it is also the distance a vehicle must still travel after
+    # crossing, so a line drawn very close to the frame edge with a large band
+    # can miss vehicles that leave the picture first. 0 disables it.
+    count_hysteresis: float = 0.02
     # Downscale frames to this width before detection/annotation (0 = keep the
     # source resolution). 1280 or 960 cuts a lot of work on 1080p/4K CCTV;
     # ANPR still crops from the full-resolution frame.
@@ -80,6 +94,11 @@ class Settings(BaseSettings):
     ffmpeg_hwaccel: str = "auto"
     # Force RTSP over TCP (far fewer corrupt frames than the UDP default).
     rtsp_transport_tcp: bool = True
+    # FFmpeg writes one line straight to stderr for every picture it cannot
+    # decode ("Could not find ref with POC 44"), which buries every other log
+    # line as soon as a feed starts losing frames. A worker collapses those
+    # into a single summary line this often. 0 prints them raw.
+    ffmpeg_log_summary_seconds: float = 30.0
     # Cap the YouTube stream resolution. A live YouTube feed is often 1080p or
     # 4K; decoding that costs far more than the detection itself and buys no
     # accuracy at imgsz=640.
@@ -88,12 +107,78 @@ class Settings(BaseSettings):
     # a whole segment at a time; buffering this many seconds and releasing at
     # the stream's own frame rate turns the bursts back into smooth video.
     capture_buffer_seconds: float = 2.0
+    # How far behind real time a live stream may drift before the reader stops
+    # replaying the backlog and skips to the newest decoded frame.
+    #
+    # The jitter buffer above paces frames out at the stream's own rate, which
+    # is only correct while detection keeps up. When it does not, pacing turns
+    # a live feed into slow motion that falls further behind for as long as the
+    # app runs -- and the drop counters stay at zero throughout, because the
+    # decoder is being blocked rather than outrun. This is the ceiling on that
+    # drift. Keep it small: catching up means jumping over the frames in
+    # between, so a bigger budget buys one large lurch, not smoothness. Set to
+    # 0 to disable skipping (only sensible for a recorded source, where
+    # processing every frame matters more than staying current).
+    max_stream_latency_seconds: float = 0.5
 
     # --- ANPR ---
     alpr_enabled: bool = True
     # Optional dedicated plate-detector weights. If empty, a heuristic ROI
-    # (lower part of the vehicle box) is used before OCR.
+    # (lower part of the vehicle box) is used before OCR. The heuristic is the
+    # biggest source of misreads, so on a machine with a GPU to spare a real
+    # detector is worth far more than any OCR tuning.
     plate_model: str = ""
+    # Inference size for the plate detector. It runs on a vehicle crop, not a
+    # full frame, so 320 is plenty -- 640 just upscales a small box.
+    plate_imgsz: int = 320
+    # Confidence threshold for the plate detector. Lower than the vehicle one:
+    # a missed plate costs a whole read, while a false box is thrown out by the
+    # plate-format check after OCR anyway.
+    plate_conf_threshold: float = 0.25
+    # Minimum EasyOCR confidence before a plate is stored. Without a floor,
+    # anything matching the Indonesian plate pattern is persisted no matter how
+    # unsure the OCR was, and a distant/blurry plate reliably produces a
+    # confident-looking string at ~0.08 that is simply wrong. A wrong plate is
+    # worse than no plate, so reads below this are dropped and the vehicle is
+    # retried on a later frame.
+    plate_min_confidence: float = 0.20
+    # How many frames to keep trying a plate for one tracked vehicle, and how
+    # often within those attempts to actually run OCR. The defaults are the
+    # CPU-era budget; on a GPU both can be far more generous, which is what
+    # decides whether a vehicle is caught on the one frame where its plate is
+    # legible (see .env.nvidia.example).
+    alpr_max_attempts: int = 12
+    alpr_attempt_interval: int = 3
+    # Which tracked classes are worth reading a plate from.
+    #
+    # Motorcycles are left out by default, and not for lack of interest: an
+    # Indonesian motorcycle plate is roughly half the width of a car plate and
+    # sits low and often angled, so on a typical overview camera it lands on a
+    # few dozen pixels and OCR returns nothing. Measured on the sample junction
+    # feed, motorcycles were 77% of the vehicles crossing the line and produced
+    # zero reads -- while still taking 77% of the OCR budget away from the cars
+    # and trucks that can be read. Add "motorcycle" back if your camera is
+    # close enough to make their plates legible.
+    alpr_classes: str = "car,truck,bus"
+    # Minimum width, in full-resolution pixels, of a vehicle box before a plate
+    # read is attempted on it.
+    #
+    # Without this the attempt budget is spent blind: a vehicle is tracked from
+    # the moment it appears at the far end of the frame -- smallest, least
+    # legible -- so the budget is typically exhausted before it comes close
+    # enough to read. A plate is roughly a quarter of the width of the vehicle
+    # around it, so 160 px of vehicle is about 40 px of plate: already marginal,
+    # and a useful floor rather than a target. Raise it until only vehicles in
+    # the readable part of your frame qualify; lower it for a close-up camera.
+    # Frames below the threshold cost no attempt, so the budget survives for
+    # where it can work.
+    alpr_min_vehicle_width: int = 160
+    # Save the full frame alongside the plate crop, with the vehicle boxed.
+    # The crop proves the characters; only the frame shows what they were
+    # attached to, which is what makes a read verifiable by a person. Costs one
+    # extra JPEG (~150 KB at 720p) per vehicle read and one frame copy per
+    # queued attempt -- turn it off if disk or CPU is tight.
+    alpr_save_frame: bool = True
     # EasyOCR languages. Indonesian plates use latin characters -> "en".
     ocr_languages: str = "en"
     # Device for EasyOCR ("cpu" / "cuda" / "mps"). Empty => follow the detector
@@ -110,8 +195,22 @@ class Settings(BaseSettings):
     sface_model: str = ""
     # Cosine similarity threshold for SFace (recommended ~0.363).
     face_similarity_threshold: float = 0.363
-    # YuNet detector input size (smaller = faster on CPU).
+    # YuNet detector input size. NOTE: this is only the initial size handed to
+    # the OpenCV backend -- both backends then size the network from the frame
+    # itself (bounded by face_max_side), so it does not bound streaming cost.
     face_det_size: int = 320
+    # Longest side a frame is downscaled to before face detection. This, not
+    # face_det_size, is what actually bounds the streaming cost.
+    face_max_side: int = 1024
+    # Which implementation runs YuNet/SFace:
+    #   "auto"    ONNX Runtime when installed (GPU-capable; 86.9 -> 16.0 ms
+    #             on a 720p frame with 5 faces), else OpenCV
+    #   "onnx"    require ONNX Runtime; disable face recognition if missing
+    #   "opencv"  force cv2.FaceDetectorYN / cv2.FaceRecognizerSF
+    # The two backends produce DIFFERENT embeddings (~0.93 cosine on identical
+    # input), so changing this invalidates every enrolled face -- re-enroll
+    # after switching. See app/detection/face.py.
+    face_backend: str = "auto"
     # Log unknown (unrecognized) faces as sightings too?
     face_log_unknown: bool = False
     # Don't log the same identity on a source more often than this (seconds).
@@ -142,6 +241,11 @@ class Settings(BaseSettings):
         return self.data_dir / "faces"
 
     @property
+    def frames_dir(self) -> Path:
+        """Full-frame evidence images for plate reads."""
+        return self.data_dir / "frames"
+
+    @property
     def yolo_model_path(self) -> str:
         """Absolute path to the weights, or the bare name for auto-download.
 
@@ -152,6 +256,28 @@ class Settings(BaseSettings):
         here means it does not matter which directory the app is started from.
         """
         raw = self.yolo_model
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            return raw
+        for base in (Path.cwd(), BASE_DIR.parent, self.weights_dir):
+            resolved = base / candidate
+            if resolved.exists():
+                return str(resolved)
+        return raw  # ultralytics will try to download it by name
+
+    @property
+    def plate_model_path(self) -> str:
+        """Absolute path to the plate-detector weights, or "" when unset.
+
+        Resolved exactly like :attr:`yolo_model_path`. Without this the .env
+        value ("data/weights/...", relative to the repo root) only worked when
+        the app happened to be started from there -- and a missing plate model
+        fails silently back to the heuristic ROI, so the misconfiguration would
+        show up as poor ANPR accuracy rather than as an error.
+        """
+        raw = self.plate_model
+        if not raw:
+            return ""
         candidate = Path(raw)
         if candidate.is_absolute():
             return raw
@@ -174,6 +300,7 @@ class Settings(BaseSettings):
         self.plates_dir.mkdir(parents=True, exist_ok=True)
         self.weights_dir.mkdir(parents=True, exist_ok=True)
         self.faces_dir.mkdir(parents=True, exist_ok=True)
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()
@@ -187,3 +314,16 @@ os.environ.setdefault("YOLO_CONFIG_DIR", str(settings.weights_dir))
 # Allowing the CPU fallback keeps inference working instead of raising; set to
 # "0" in the environment to surface such gaps instead.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# CUDA: every source is its own process with its own caching allocator, so on a
+# single 8 GB card the workers are competing for one pool. Expandable segments
+# let the allocator grow and give back a region instead of stranding it at the
+# size of the largest block it once held, which is what fragments a long run
+# with variable-sized plate crops.
+#
+# Windows is excluded on purpose: the allocator there does not implement it and
+# warns once per worker process ("expandable_segments not supported on this
+# platform"), which is pure noise. Detector.trim_memory() is what keeps memory
+# in check on that platform.
+if sys.platform != "win32":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")

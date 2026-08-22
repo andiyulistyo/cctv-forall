@@ -92,7 +92,7 @@ app.add_middleware(
 def health():
     """Liveness plus the runtime facts you need to confirm acceleration is on
     (device actually selected, hardware decoder, thread budget per worker)."""
-    from .detection.detector import plan_inference
+    from .detection.detector import gpu_thread_cap, plan_inference
 
     model_path = settings.yolo_model_path
     plan = plan_inference(model_path, settings.device, settings.inference_half)
@@ -111,6 +111,7 @@ def health():
                 settings.threads_per_worker,
                 settings.expected_streams,
                 gpu=not plan.cpu_bound,
+                gpu_thread_cap=gpu_thread_cap(plan),
             ),
             "ffmpeg_hwaccel": settings.ffmpeg_hwaccel or None,
         },

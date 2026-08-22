@@ -1,0 +1,45 @@
+# Optional extras for a machine with an NVIDIA GPU.
+#
+#   pip install -r backend/requirements-cuda.txt
+#
+# None of this is needed just to run detection on the GPU: DEVICE=cuda with
+# plain .pt weights and INFERENCE_HALF=true already uses the card, which is what
+# .env.nvidia.example does. These packages accelerate the two parts that torch
+# does not cover.
+
+# --- Face recognition on the GPU (recommended) ---
+# YuNet + SFace are ONNX models that the app runs through cv2.dnn by default,
+# and the pip build of OpenCV has no CUDA backend -- so without this they are
+# stuck on the CPU. Measured on an RTX 5070 Laptop, one 1280x720 frame with 5
+# faces (detect + embed): cv2.dnn 86.9 ms -> onnxruntime CUDA 16.0 ms.
+#
+# Most of that comes from the GPU: the same models on ONNX Runtime's CPU
+# provider take 61.8 ms. Installing this on a CPU-only machine is still a small
+# win (FACE_BACKEND falls back to the CPU execution provider automatically),
+# just nothing like the same margin.
+#
+# No separate CUDA Toolkit is required: onnxruntime-gpu 1.29 links against
+# CUDA 13 + cuDNN 9, which is exactly what the +cu130 torch wheel already ships
+# in torch/lib, and app/detection/onnx_face.py points the loader at it.
+#
+# ⚠️ The ONNX and OpenCV backends produce DIFFERENT embeddings (~0.93 cosine on
+# identical input -- cv2.dnn deviates from ONNX semantics). Enrolled faces must
+# be re-enrolled after switching FACE_BACKEND. See app/detection/face.py.
+onnxruntime-gpu>=1.24
+# Used once at load time to make YuNet's fixed 640x640 input dimension
+# symbolic, so the network can be fed at the frame's own resolution instead of
+# losing small faces to a forced downscale.
+onnx>=1.16
+
+# --- TensorRT (optional, and probably unnecessary) ---
+# Only for exporting a YOLO .engine with scripts/export_tensorrt.py. Measure
+# first: on an RTX 5070 Laptop with yolo11m at imgsz 640, only about 4 of the
+# ~11 ms per frame is inference -- the rest is the letterbox, NMS and the
+# Python round-trip in ultralytics. TensorRT can only shrink that 4 ms.
+#
+# It is also a large download and the engine it builds is tied to this GPU,
+# this driver and this TensorRT version. Uncomment only if the benchmark shows
+# the gain is worth it.
+#
+# >=10.13 is the first series with kernels for sm_120 (Blackwell / RTX 50).
+# tensorrt>=10.13

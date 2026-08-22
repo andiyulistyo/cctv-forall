@@ -1,24 +1,31 @@
 <#
 .SYNOPSIS
-  One-time setup for running the dashboard natively on Windows (AMD Ryzen or
-  Intel Core), accelerated with OpenVINO.
+  One-time setup for running the dashboard natively on Windows, on an NVIDIA
+  GPU (CUDA) or on the CPU/iGPU via OpenVINO.
 
 .DESCRIPTION
   Docker Desktop on Windows cannot pass an integrated GPU into a container, so
   a native install is the only way to get hardware acceleration on these
-  machines. The script picks a profile from the CPU vendor:
+  machines. The script picks a profile from the hardware:
 
+    NVIDIA GPU -> CUDA (torch fp16, yolo11m, EasyOCR and the plate detector
+                  on the GPU as well)
     AMD Ryzen  -> OpenVINO CPU plugin (INT8, uses AVX-512/VNNI on Zen 4)
     Intel Core -> OpenVINO GPU plugin (FP16 on the integrated HD/Iris graphics)
 
+  The GPU is checked before the CPU vendor: an NVIDIA laptop almost always has
+  an AMD or Intel CPU too, and choosing on the CPU there would configure the
+  OpenVINO CPU plugin and leave the discrete card idle.
+
 .EXAMPLE
   .\scripts\setup_windows.ps1
+  .\scripts\setup_windows.ps1 -Hardware nvidia
   .\scripts\setup_windows.ps1 -Hardware intel -YoloModel yolo11n.pt
 #>
 [CmdletBinding()]
 param(
-    # amd | intel | auto
-    [ValidateSet('auto', 'amd', 'intel')]
+    # nvidia | amd | intel | auto
+    [ValidateSet('auto', 'nvidia', 'amd', 'intel')]
     [string]$Hardware = 'auto',
     # Base weights to download and export. Default depends on the profile.
     [string]$YoloModel = '',
@@ -53,19 +60,49 @@ $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1)
 Write-Host "    $($cpu.Name)"
 Write-Host "    $($cpu.NumberOfCores) physical cores / $($cpu.NumberOfLogicalProcessors) logical"
 
+# A discrete NVIDIA card beats anything the CPU side can offer, so look there
+# first. nvidia-smi ships with the driver; if it runs and lists a GPU, we have
+# one. (Get-CimInstance Win32_VideoController would also see it, but it reports
+# the card even when no usable driver is installed.)
+$nvidiaGpu = $null
+$smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+if ($smi) {
+    $names = & $smi.Source --query-gpu=name --format=csv,noheader
+    if ($LASTEXITCODE -eq 0 -and $names) { $nvidiaGpu = @($names)[0].Trim() }
+}
+if ($nvidiaGpu) { Write-Host "    $nvidiaGpu" }
+
 if ($Hardware -eq 'auto') {
-    if ($cpu.Name -match 'AMD|Ryzen') { $Hardware = 'amd' }
-    elseif ($cpu.Name -match 'Intel')  { $Hardware = 'intel' }
+    if     ($nvidiaGpu)                    { $Hardware = 'nvidia' }
+    elseif ($cpu.Name -match 'AMD|Ryzen')  { $Hardware = 'amd' }
+    elseif ($cpu.Name -match 'Intel')      { $Hardware = 'intel' }
     else {
         Write-Warning "Unrecognised CPU; defaulting to the AMD (CPU plugin) profile."
         $Hardware = 'amd'
     }
 }
+if ($Hardware -eq 'nvidia' -and -not $nvidiaGpu) {
+    throw ("-Hardware nvidia was requested but nvidia-smi found no GPU. Install " +
+           "the NVIDIA driver, or re-run without -Hardware to auto-detect.")
+}
 Write-Host "    profile: $Hardware" -ForegroundColor Yellow
 
 # Profile defaults. The Intel box in mind here is a 2-core Kaby Lake i7, which
 # needs the small model at a reduced input size; the Ryzen has cores to spare.
-if ($Hardware -eq 'intel') {
+# Only the OpenVINO profiles export an IR; $UseOpenVino gates every step that
+# is specific to them.
+$UseOpenVino = $Hardware -ne 'nvidia'
+
+if ($Hardware -eq 'nvidia') {
+    # The GPU has headroom to spare, and at imgsz 640 the medium model costs
+    # essentially nothing over the small one -- the bottleneck at that point is
+    # the CPU-side letterbox/NMS, not the matmuls.
+    if (-not $YoloModel) { $YoloModel = 'yolo11m.pt' }
+    if ($ImgSz -le 0)    { $ImgSz = 640 }
+    $ExportArgs = @()
+    $EnvExample = '.env.nvidia.example'
+    $WarmEasyOcr = $true
+} elseif ($Hardware -eq 'intel') {
     if (-not $YoloModel) { $YoloModel = 'yolo11n.pt' }
     if ($ImgSz -le 0)    { $ImgSz = 480 }
     $ExportArgs = @('--half')          # FP16 is the iGPU's native precision
@@ -134,14 +171,60 @@ if (-not (Test-Path $Py)) {
 }
 Invoke-Native 'pip self-upgrade' $Py -m pip install --upgrade pip wheel
 
-Write-Host '==> Installing PyTorch (CPU build)' -ForegroundColor Cyan
-# Inference runs through OpenVINO; torch is still needed by ultralytics for
-# pre/post-processing and by EasyOCR, so the small CPU wheel is enough.
-Invoke-Native 'torch install' $Py -m pip install torch torchvision `
-    --index-url https://download.pytorch.org/whl/cpu
+if ($Hardware -eq 'nvidia') {
+    Write-Host '==> Installing PyTorch (CUDA 13 build)' -ForegroundColor Cyan
+    # cu130, not the default wheel: RTX 50-series is sm_120 (Blackwell) and the
+    # cu128-and-earlier builds have no kernels for it -- they install happily and
+    # then fail at the first launch. CUDA is backward compatible with older
+    # cards, so this is also the right wheel for a 40- or 30-series.
+    Invoke-Native 'torch install' $Py -m pip install --force-reinstall torch torchvision `
+        --index-url https://download.pytorch.org/whl/cu130
+} else {
+    Write-Host '==> Installing PyTorch (CPU build)' -ForegroundColor Cyan
+    # Inference runs through OpenVINO; torch is still needed by ultralytics for
+    # pre/post-processing and by EasyOCR, so the small CPU wheel is enough.
+    Invoke-Native 'torch install' $Py -m pip install torch torchvision `
+        --index-url https://download.pytorch.org/whl/cpu
+}
 
 Write-Host '==> Installing the backend requirements' -ForegroundColor Cyan
 Invoke-Native 'requirements.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements.txt')
+
+if ($Hardware -eq 'nvidia') {
+    Write-Host '==> Checking torch can reach the GPU' -ForegroundColor Cyan
+    # Same shape as the OpenVINO probe below, and for the same reason: report
+    # failure on stdout instead of letting Python write a traceback to stderr.
+    $cudaProbe = @'
+import sys
+try:
+    import torch
+except Exception as exc:
+    print('FAILED|%s: %s' % (type(exc).__name__, exc))
+    sys.exit(2)
+if not torch.cuda.is_available():
+    print('FAILED|torch %s reports no CUDA device' % torch.__version__)
+    sys.exit(2)
+p = torch.cuda.get_device_properties(0)
+print('OK|%s|%d MiB|sm_%d%d|torch %s' % (p.name, p.total_memory // (1024*1024),
+                                         p.major, p.minor, torch.__version__))
+'@
+    $cudaResult = & $Py -c $cudaProbe
+    if ($LASTEXITCODE -ne 0 -or "$cudaResult" -notmatch '^OK\|') {
+        Write-Host "    $cudaResult" -ForegroundColor Red
+        throw ("PyTorch is installed but cannot use the GPU. Check that the " +
+               "NVIDIA driver is current (nvidia-smi works), then re-run. " +
+               "A '+cpu' torch version in the message above means the CPU wheel " +
+               "is still installed and the cu130 install did not take effect.")
+    }
+    Write-Host "    $(("$cudaResult" -split '\|', 2)[1])" -ForegroundColor Yellow
+
+    Write-Host '==> Installing the GPU extras (ONNX Runtime for face recognition)' -ForegroundColor Cyan
+    # YuNet/SFace are ONNX models and cv2.dnn has no CUDA backend, so without
+    # this face recognition is the slowest step in the pipeline by a wide
+    # margin. No separate CUDA Toolkit needed: onnxruntime-gpu links against
+    # CUDA 13 + cuDNN 9, which the cu130 torch wheel already ships.
+    Invoke-Native 'requirements-cuda.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements-cuda.txt')
+} else {
 
 Write-Host '==> Installing the OpenVINO runtime' -ForegroundColor Cyan
 Invoke-Native 'requirements-openvino.txt install' $Py -m pip install -r (Join-Path $Backend 'requirements-openvino.txt')
@@ -181,6 +264,8 @@ if ($Hardware -eq 'intel' -and $devices -notmatch 'GPU') {
     Write-Warning 'No OpenVINO GPU device found. Update the Intel Graphics driver, then re-run. Falling back to the CPU plugin for now.'
 }
 
+}
+
 Write-Host '==> Fetching model weights into data\weights' -ForegroundColor Cyan
 $Weights = Join-Path $Root 'data\weights'
 New-Item -ItemType Directory -Force -Path (Join-Path $Weights 'face') | Out-Null
@@ -200,16 +285,41 @@ foreach ($name in $faceModels.Keys) {
     if (-not (Test-Path $dest)) { Invoke-WebRequest -Uri $faceModels[$name] -OutFile $dest }
 }
 
-Write-Host "==> Exporting $YoloModel to OpenVINO IR (imgsz=$ImgSz $ExportArgs)" -ForegroundColor Cyan
-Push-Location $Backend
-try {
-    Invoke-Native 'OpenVINO export' $Py (Join-Path $Root 'scripts\export_openvino.py') `
-        --model (Join-Path $Weights $YoloModel) --imgsz $ImgSz @ExportArgs
-} finally { Pop-Location }
+# Dedicated plate detector for ANPR. Without it alpr.py falls back to a
+# heuristic ROI (the bottom 45% of the vehicle box), which is the single
+# biggest source of misreads. A YOLO11 fine-tune, so ultralytics loads it
+# as-is, and next to the vehicle model on a GPU it costs almost nothing.
+if ($Hardware -eq 'nvidia') {
+    $plateModel = 'license-plate-finetune-v1s.pt'
+    $plateDest = Join-Path $Weights $plateModel
+    if (-not (Test-Path $plateDest)) {
+        Write-Host "    downloading $plateModel"
+        Invoke-WebRequest -OutFile $plateDest -Uri `
+            "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/main/$plateModel"
+    }
+}
+
+if ($UseOpenVino) {
+    Write-Host "==> Exporting $YoloModel to OpenVINO IR (imgsz=$ImgSz $ExportArgs)" -ForegroundColor Cyan
+    Push-Location $Backend
+    try {
+        Invoke-Native 'OpenVINO export' $Py (Join-Path $Root 'scripts\export_openvino.py') `
+            --model (Join-Path $Weights $YoloModel) --imgsz $ImgSz @ExportArgs
+    } finally { Pop-Location }
+} else {
+    # The CUDA profile runs the .pt weights directly in fp16. A TensorRT engine
+    # is faster still, but only by the share of the frame time that is actually
+    # inference -- read scripts/export_tensorrt.py before spending time on it.
+    Write-Host "==> Using $YoloModel directly (torch fp16 on the GPU)" -ForegroundColor Cyan
+}
 
 if ($WarmEasyOcr) {
     Write-Host '==> Warming up EasyOCR (downloads its models once)' -ForegroundColor Cyan
-    Invoke-Native 'EasyOCR warmup' $Py -c "import easyocr; easyocr.Reader(['en'], gpu=False, verbose=False)"
+    # EasyOCR is a torch model, so on the CUDA profile it runs on the GPU too.
+    # The download is the same either way, but warming it there also proves the
+    # GPU path works before the first live stream depends on it.
+    $ocrGpu = if ($Hardware -eq 'nvidia') { 'True' } else { 'False' }
+    Invoke-Native 'EasyOCR warmup' $Py -c "import easyocr; easyocr.Reader(['en'], gpu=$ocrGpu, verbose=False)"
 }
 
 if (-not $SkipFrontend) {
@@ -235,6 +345,12 @@ if (-not (Test-Path $envPath)) {
     Write-Host "    compare it against $EnvExample for the $Hardware settings."
 }
 
+# The OpenVINO profiles benchmark the exported IR directory; the CUDA profile
+# benchmarks the weights themselves.
+$BenchModel = if ($UseOpenVino) {
+    "$([IO.Path]::GetFileNameWithoutExtension($YoloModel))_openvino_model"
+} else { $YoloModel }
+
 Write-Host @"
 
 Setup complete.
@@ -242,7 +358,7 @@ Setup complete.
   Start the app:      .\scripts\run_windows.ps1
   Confirm the device: curl http://localhost:8000/api/health
   Measure throughput: backend\.venv\Scripts\python scripts\benchmark.py ``
-                        --model data\weights\$([IO.Path]::GetFileNameWithoutExtension($YoloModel))_openvino_model ``
+                        --model data\weights\$BenchModel ``
                         --imgsz $ImgSz
 
 "@ -ForegroundColor Green

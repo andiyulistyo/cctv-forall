@@ -24,7 +24,9 @@ import numpy as np  # noqa: E402
 
 from app.runtime import (  # noqa: E402
     chip_name,
+    cuda_devices,
     describe,
+    has_cuda,
     has_intel_gpu,
     has_mps,
     openvino_devices,
@@ -64,21 +66,22 @@ def auto_devices(model_path: str) -> list[str]:
     """
     from app.detection.detector import is_non_torch_model, is_openvino_model
 
+    from pathlib import Path as _Path
+
     if is_openvino_model(model_path):
         devices = ["intel:cpu"]
         if has_intel_gpu():
             devices.append("intel:gpu")
         return devices
+    if _Path(model_path).suffix.lower() == ".engine":
+        # A TensorRT engine only runs on the GPU it was built for. Listing it
+        # here lets you compare an engine against .pt fp16 in one run.
+        return ["cuda"]
     if is_non_torch_model(model_path):
         return [""]  # the bundle picks its own runtime
     devices = ["cpu"]
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            devices.append("cuda")
-    except Exception:
-        pass
+    if has_cuda():
+        devices.append("cuda")
     if has_mps():
         devices.append("mps")
     return devices
@@ -96,16 +99,32 @@ def main() -> None:
         default="auto",
         help="comma separated, or 'auto' to test everything this machine supports",
     )
-    ap.add_argument("--half", action="store_true", help="also test fp16 on GPU devices")
+    ap.add_argument(
+        "--half",
+        action="store_true",
+        help="also test fp16 on MPS (CUDA is measured in fp16 by default)",
+    )
+    ap.add_argument(
+        "--no-half",
+        action="store_true",
+        help="skip the fp16 run on CUDA and measure fp32 only",
+    )
     args = ap.parse_args()
 
     info = describe()
     print(f"{chip_name()} — {info['cpu_cores']} logical / {physical_cores()} physical cores")
     print(
         f"torch {info.get('torch')}  mps={info.get('mps_available')}  "
-        f"cuda={info.get('cuda_available')}  "
+        f"cuda={info.get('cuda_available')} (CUDA {info.get('cuda_version')})  "
         f"openvino={info.get('openvino')} {list(openvino_devices())}"
     )
+    for gpu in cuda_devices():
+        # Compute capability is the number that decides whether the installed
+        # wheel has kernels for this card at all (sm_120 = Blackwell).
+        print(
+            f"GPU {gpu['index']}: {gpu['name']} — {gpu['total_memory_mb']} MiB, "
+            f"compute capability {gpu['capability']}"
+        )
     print(f"model={args.model} imgsz={args.imgsz} input={args.width}x{args.height}\n")
 
     if args.devices.strip().lower() == "auto":
@@ -116,9 +135,13 @@ def main() -> None:
     size = (args.width, args.height)
     runs: list[tuple[str, bool]] = []
     for d in devices:
-        runs.append((d, False))
-        # fp16 only means something on a torch GPU device.
-        if args.half and d in ("cuda", "mps"):
+        # fp16 is the production setting on CUDA (.env.nvidia.example sets
+        # INFERENCE_HALF=true), so measure it by default rather than hiding the
+        # real number behind a flag. MPS stays opt-in: results there are mixed.
+        cuda_half = d == "cuda" and not args.no_half
+        if not cuda_half:
+            runs.append((d, False))
+        if cuda_half or (args.half and d in ("cuda", "mps")):
             runs.append((d, True))
 
     results: dict[str, float] = {}

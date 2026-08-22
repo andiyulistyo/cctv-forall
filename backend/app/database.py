@@ -44,8 +44,34 @@ def get_db():
         db.close()
 
 
+# Columns added after a release, as (table, column, SQLite type). Adding one to
+# a model is not enough on its own: create_all() only creates missing *tables*,
+# so an existing database keeps its old shape and every query touching the new
+# column fails at runtime. SQLite's ALTER TABLE ADD COLUMN is the whole
+# migration story here -- it is cheap, and appending a nullable column never
+# rewrites the table.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("sources", "alpr_zone", "JSON"),
+    ("plate_reads", "frame_path", "TEXT"),
+)
+
+
+def _add_missing_columns() -> None:
+    with engine.begin() as conn:
+        for table, column, column_type in _ADDED_COLUMNS:
+            rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            if not rows:
+                continue  # table does not exist yet; create_all just made it
+            if column in {r[1] for r in rows}:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+            )
+
+
 def init_db() -> None:
-    """Create tables. Imported models must be registered before calling."""
+    """Create tables and bring an existing database up to the current shape."""
     from . import models  # noqa: F401  (ensures models are imported)
 
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()

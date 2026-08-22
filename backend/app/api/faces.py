@@ -35,6 +35,8 @@ def get_recognizer() -> FaceRecognizer:
             settings.yunet_model_path,
             settings.sface_model_path,
             det_size=settings.face_det_size,
+            max_side=settings.face_max_side,
+            backend=settings.face_backend,
         )
     if not _recognizer.available:
         raise HTTPException(

@@ -11,7 +11,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---------- Stage 2: CUDA python backend ----------
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS backend
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu22.04 AS backend
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,9 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
-# CUDA build of torch/torchvision (cu124).
-RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 \
-    --index-url https://download.pytorch.org/whl/cu124
+# CUDA build of torch/torchvision (cu130).
+# CUDA 13, not the 12.4/cu124 this used to pin: RTX 50-series is sm_120
+# (Blackwell) and the cu128-and-earlier wheels have no kernels for it -- they
+# install fine and then fail at the first launch. CUDA is backward compatible
+# with older cards, so cu130 is also correct for a 40- or 30-series.
+RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 \
+    --index-url https://download.pytorch.org/whl/cu130
 
 WORKDIR /app/backend
 COPY backend/requirements.txt ./

@@ -98,7 +98,15 @@ export default function Dashboard() {
                   ))}
                 </div>
                 {s.status_message && (
-                  <div className="mt-2 truncate text-xs text-red-400" title={s.status_message}>
+                  /* A message on a source that is still running is a warning
+                     (mis. frame yang hilang karena stream terlalu berat), bukan
+                     kegagalan — warnanya jangan sekeras status error. */
+                  <div
+                    className={`mt-2 truncate text-xs ${
+                      s.status === "running" ? "text-amber-400" : "text-red-400"
+                    }`}
+                    title={s.status_message}
+                  >
                     {s.status_message}
                   </div>
                 )}

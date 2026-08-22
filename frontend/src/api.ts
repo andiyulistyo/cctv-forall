@@ -15,6 +15,8 @@ export interface Source {
   alpr_enabled: boolean;
   face_enabled: boolean;
   line: { a: number[]; b: number[] } | null;
+  /** Where plates are read. Two opposite corners, normalized 0..1. null = anywhere. */
+  alpr_zone: { a: number[]; b: number[] } | null;
   direction_labels: { in: string; out: string };
   status: string;
   status_message: string | null;
@@ -56,6 +58,8 @@ export interface Plate {
   plate_text: string;
   confidence: number;
   has_image: boolean;
+  /** A full frame of the moment was kept, with the vehicle boxed. */
+  has_frame: boolean;
   timestamp: string;
 }
 
@@ -139,6 +143,12 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ line: { a, b }, direction_labels: labels }),
     }),
+  /** Pass null to clear the zone and go back to reading anywhere in the frame. */
+  setAlprZone: (id: number, zone: { a: number[]; b: number[] } | null) =>
+    request<Source>(`/sources/${id}/alpr-zone`, {
+      method: "PUT",
+      body: JSON.stringify({ zone }),
+    }),
   getCounts: (sourceId?: number) =>
     request<CountsResponse>(`/counts${sourceId ? `?source=${sourceId}` : ""}`),
   listPlates: (sourceId?: number, limit = 100) =>
@@ -174,6 +184,7 @@ export const api = {
   // Media URLs (token via query string for <img>/stream tags)
   streamUrl: (id: number) => `${BASE}/streams/${id}?token=${getToken() ?? ""}`,
   plateImageUrl: (id: number) => `${BASE}/plates/${id}/image?token=${getToken() ?? ""}`,
+  plateFrameUrl: (id: number) => `${BASE}/plates/${id}/frame?token=${getToken() ?? ""}`,
   faceImageUrl: (id: number) => `${BASE}/faces/${id}/image?token=${getToken() ?? ""}`,
   sightingImageUrl: (id: number) => `${BASE}/sightings/${id}/image?token=${getToken() ?? ""}`,
 

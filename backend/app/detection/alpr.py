@@ -32,11 +32,25 @@ def looks_like_plate(normalized: str) -> bool:
 
 
 class ALPR:
-    def __init__(self, languages: str = "en", device: str = "cpu", plate_model: str = ""):
+    def __init__(
+        self,
+        languages: str = "en",
+        device: str = "cpu",
+        plate_model: str = "",
+        plate_imgsz: int = 320,
+        plate_conf: float = 0.25,
+        min_confidence: float = 0.20,
+        half: bool = False,
+    ):
         self._reader = None
         self._plate_detector = None
         self._available = False
         self.device = device or "cpu"
+        self.plate_imgsz = plate_imgsz
+        self.plate_conf = plate_conf
+        self.min_confidence = min_confidence
+        # fp16 is a GPU-only win, exactly as for the vehicle detector.
+        self.half = bool(half) and self.device != "cpu"
         try:
             import easyocr
 
@@ -63,6 +77,15 @@ class ALPR:
                 from ultralytics import YOLO
 
                 self._plate_detector = YOLO(plate_model)
+                # Warm it on the target device: the first call on CUDA pays
+                # context + autotune, and here that would land on a live frame.
+                self._plate_detector.predict(
+                    np.zeros((plate_imgsz, plate_imgsz, 3), dtype=np.uint8),
+                    imgsz=self.plate_imgsz,
+                    device=self.device,
+                    half=self.half,
+                    verbose=False,
+                )
             except Exception as exc:
                 print(f"[ALPR] plate detector disabled: {exc}")
                 self._plate_detector = None
@@ -74,7 +97,16 @@ class ALPR:
     def _plate_roi(self, vehicle_crop: np.ndarray) -> np.ndarray:
         """Return the region most likely to contain the plate."""
         if self._plate_detector is not None:
-            res = self._plate_detector.predict(vehicle_crop, verbose=False)
+            # Without an explicit device this silently ran on the ultralytics
+            # default rather than alongside the vehicle detector.
+            res = self._plate_detector.predict(
+                vehicle_crop,
+                imgsz=self.plate_imgsz,
+                device=self.device,
+                half=self.half,
+                conf=self.plate_conf,
+                verbose=False,
+            )
             if res and res[0].boxes is not None and len(res[0].boxes) > 0:
                 # Highest-confidence plate box.
                 boxes = res[0].boxes
@@ -123,5 +155,11 @@ class ALPR:
         text, conf = best
         # Require a plausible plate to cut down on noise.
         if not looks_like_plate(text):
+            return None
+        # ...and require the OCR to have actually been sure of it. The pattern
+        # check alone is weak: a blurry plate at distance still yields a string
+        # that matches it, just not the right one. Returning None here leaves
+        # the track unresolved so a closer frame gets another go.
+        if conf < self.min_confidence:
             return None
         return text, conf, roi

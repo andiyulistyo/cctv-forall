@@ -371,26 +371,42 @@ class BufferedFrameReader:
 
     * **Chunked HTTP** (HLS / YouTube) — FFmpeg downloads a whole segment as
       fast as it can, then waits for the next. Frames arrive in bursts of
-      hundreds followed by seconds of nothing. Here dropping is exactly wrong;
-      instead the burst is buffered and released at the stream's own frame
-      rate (``paced=True``), which is what a video player does.
+      hundreds followed by seconds of nothing. Here dropping every burst is
+      exactly wrong; instead the burst is buffered and released at the stream's
+      own frame rate (``paced=True``), which is what a video player does.
 
-    In both cases the oldest frame is dropped when the buffer is full: on a
+      Pacing alone is only right while the consumer can keep up. When it
+      cannot, releasing every frame on the stream's clock means playing a live
+      feed in slow motion, drifting further into the past with every frame —
+      and because a blocked producer never overflows the queue, nothing looks
+      wrong from the outside. So the paced consumer also watches its own
+      schedule: once it is more than ``max_latency`` behind, it throws away
+      what piled up and resumes from the newest frame (``max_latency=0``
+      disables that, for a source that is not live).
+
+    In every case the oldest frame is dropped when we cannot keep up: on a
     live source, being behind is worse than missing a frame.
     """
 
     def __init__(self, reader: SourceReader, buffer_frames: int = 1, paced: bool = False,
-                 backpressure: bool = False, default_fps: float = 25.0):
+                 backpressure: bool = False, default_fps: float = 25.0,
+                 max_latency: float = 0.0):
         self._reader = reader
-        self._paced = paced
+        self.paced = paced
         self._backpressure = backpressure
         self._default_fps = default_fps
+        self._max_latency = max(0.0, max_latency)
         # A Queue, not a deque + Event: its condition variable has no
         # lost-wakeup race, which otherwise leaves the consumer blocked while
         # frames are already waiting for it.
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, buffer_frames))
         self.dropped = 0
         self.captured = 0
+        # Newest decoded frame, for anything that wants to *see* the source
+        # rather than process it -- the live preview. Kept beside the queue,
+        # not in it: reading it neither consumes a frame nor waits for one, so
+        # a slow consumer cannot hold the picture back.
+        self.latest = None
 
     @property
     def _interval(self) -> float:
@@ -426,6 +442,27 @@ class BufferedFrameReader:
                 except queue.Empty:
                     pass
 
+    def _skip_to_newest(self, frame):
+        """Discard everything queued and return the most recent frame.
+
+        Used when the consumer has fallen too far behind real time: the frames
+        in between are already stale, and handing them over one by one is what
+        turns a live feed into slow motion.
+        """
+        while True:
+            try:
+                newer = self._queue.get_nowait()
+            except queue.Empty:
+                return frame
+            if newer is None:
+                # The producer finished. Put the sentinel back so the consumer
+                # loop still sees it -- the queue was just emptied, so there is
+                # room for it.
+                self._queue.put_nowait(None)
+                return frame
+            self.dropped += 1
+            frame = newer
+
     def frames(self, stop_flag, on_error=None) -> Iterator["cv2.typing.MatLike"]:
         finished = threading.Event()
 
@@ -433,6 +470,7 @@ class BufferedFrameReader:
             try:
                 for frame in self._reader.frames(stop_flag, on_error=on_error):
                     self.captured += 1
+                    self.latest = frame
                     self._offer(frame)
             finally:
                 finished.set()
@@ -457,14 +495,25 @@ class BufferedFrameReader:
                 if frame is None:  # producer finished
                     break
 
-                if self._paced:
+                if self.paced:
                     # Release on the stream's own clock so a downloaded burst
                     # plays back as smooth video rather than a jump forward.
                     now = time.monotonic()
                     if next_due > now:
                         time.sleep(min(next_due - now, 1.0))
-                    # Don't let the schedule run away if we fell behind.
-                    next_due = max(next_due, now - self._interval) + self._interval
+                        next_due += self._interval
+                    elif self._max_latency and now - next_due > self._max_latency:
+                        # Consistently slower than the stream produces. Every
+                        # frame released here is one more frame into the past,
+                        # so skip to what is actually current instead.
+                        frame = self._skip_to_newest(frame)
+                        next_due = time.monotonic() + self._interval
+                    else:
+                        # Late, but within budget. Advance the schedule by
+                        # exactly one interval rather than resetting it to now:
+                        # forgiving the lag on every frame is what let it grow
+                        # without ever tripping the check above.
+                        next_due += self._interval
                 yield frame
         finally:
             thread.join(timeout=5.0)

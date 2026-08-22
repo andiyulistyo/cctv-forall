@@ -153,6 +153,66 @@ def has_mps() -> bool:
         return False
 
 
+def has_cuda() -> bool:
+    """True when torch can run on an NVIDIA GPU.
+
+    Deliberately not cached: a CPU-only torch wheel is the usual reason this is
+    False, and re-installing the CUDA wheel is exactly what the operator does
+    next -- caching False across a long-lived process would hide the fix.
+    """
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def cuda_devices() -> tuple[dict, ...]:
+    """One entry per visible NVIDIA GPU, empty when there is none.
+
+    ``capability`` is the compute capability ("12.0" on Blackwell). It is worth
+    reporting because it is what decides whether the installed wheel can run
+    here at all: an RTX 50-series card is sm_120 and needs a CUDA 12.8+ build,
+    and an older wheel fails at the first kernel launch rather than at import.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return ()
+        out = []
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            out.append({
+                "index": i,
+                "name": props.name,
+                "total_memory_mb": round(props.total_memory / (1024 * 1024)),
+                "capability": f"{props.major}.{props.minor}",
+            })
+        return tuple(out)
+    except Exception:
+        return ()
+
+
+def gpu_vendor() -> str:
+    """Accelerator vendor to build a profile around: ``nvidia`` / ``intel`` /
+    ``apple`` / ``none``.
+
+    Checked *before* :func:`cpu_vendor` by the setup scripts. The two disagree
+    often -- an NVIDIA laptop usually has an AMD or Intel CPU -- and picking the
+    profile from the CPU there would set up the OpenVINO CPU plugin and leave
+    the discrete GPU idle.
+    """
+    if has_cuda():
+        return "nvidia"
+    if is_apple_silicon():
+        return "apple"
+    if has_intel_gpu():
+        return "intel"
+    return "none"
+
+
 @lru_cache(maxsize=None)
 def openvino_devices() -> tuple[str, ...]:
     """OpenVINO devices present on this machine, e.g. ``("CPU", "GPU")``.
@@ -187,7 +247,13 @@ def openvino_version() -> str | None:
         return None
 
 
-def threads_per_worker(configured: int, expected_streams: int, gpu: bool) -> int:
+def threads_per_worker(
+    configured: int,
+    expected_streams: int,
+    gpu: bool,
+    *,
+    gpu_thread_cap: int = 2,
+) -> int:
     """Resolve the CPU thread budget for a single detection worker.
 
     ``configured`` > 0 wins. Otherwise the cores are split across the number of
@@ -195,6 +261,12 @@ def threads_per_worker(configured: int, expected_streams: int, gpu: bool) -> int
     and for video decoding. When inference runs on an accelerator (MPS, CUDA,
     CoreML, OpenVINO GPU) the CPU only does pre/post-processing, so a small
     budget is plenty.
+
+    ``gpu_thread_cap`` is how small "plenty" is. The default of 2 suits the
+    integrated accelerators, where the CPU is also the thing feeding them. A
+    discrete CUDA card is different: inference leaves the cores free, but the
+    worker still resizes, letterboxes, draws and JPEG-encodes every frame on
+    them, so callers on that path pass a higher cap.
     """
     if configured > 0:
         return configured
@@ -203,7 +275,7 @@ def threads_per_worker(configured: int, expected_streams: int, gpu: bool) -> int
     budget = max(1, cores // streams)
     if gpu:
         # The accelerator does the matmuls; more CPU threads only add contention.
-        budget = min(budget, 2)
+        budget = min(budget, max(1, gpu_thread_cap))
     return max(1, min(budget, cores))
 
 
@@ -295,6 +367,7 @@ def describe() -> dict:
         # Kept under the old name too: the Apple Silicon docs refer to it.
         "performance_cores": physical_cores(),
         "apple_silicon": is_apple_silicon(),
+        "gpu_vendor": gpu_vendor(),
         "openvino": openvino_version(),
         "openvino_devices": list(openvino_devices()),
     }
@@ -303,6 +376,10 @@ def describe() -> dict:
 
         info["torch"] = torch.__version__
         info["cuda_available"] = bool(torch.cuda.is_available())
+        # None on a CPU-only wheel -- the quickest way to tell "no GPU here"
+        # apart from "GPU present but the wrong torch build is installed".
+        info["cuda_version"] = torch.version.cuda
+        info["cuda_devices"] = [dict(d) for d in cuda_devices()]
         info["mps_available"] = bool(
             getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
         )

@@ -22,6 +22,7 @@ frontend/dist/
 !.env.macos.example
 !.env.amd.example
 !.env.intel.example
+!.env.nvidia.example
 
 # Editor leftovers. ".env~" and "..env.un~" match none of the patterns above,
 # so without these an editor backup of .env is left staged and ready to commit.
@@ -30,3 +31,6 @@ frontend/dist/
 *.swp
 *.bak
 *.orig
+
+# Claude Code local state (worktrees, session settings).
+.claude/

@@ -60,6 +60,17 @@ class Source(Base):
         JSON, default=lambda: {"in": "in", "out": "out"}
     )
 
+    # Plate-reading zone, normalized 0..1: {"a": [x, y], "b": [x, y]} for the
+    # top-left and bottom-right corners. None means "read anywhere".
+    #
+    # Where a plate is legible is a property of the camera, not of the model:
+    # it depends on distance, angle and lens, and only the person looking at
+    # the picture knows where that is. Reading everywhere instead spends the
+    # per-vehicle attempt budget on the far end of the frame, where the plate
+    # is a few pixels wide, and gives up before the vehicle arrives somewhere
+    # it could have been read.
+    alpr_zone: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     alpr_enabled: Mapped[bool] = mapped_column(Integer, default=1)
     face_enabled: Mapped[bool] = mapped_column(Integer, default=0)
 
@@ -111,6 +122,10 @@ class PlateRead(Base):
     plate_text: Mapped[str] = mapped_column(String(30), index=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Full frame at the moment of the read, with the vehicle boxed. The plate
+    # crop alone proves the characters but not what they were attached to; this
+    # is what lets a person confirm the vehicle behind a plate.
+    frame_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     source: Mapped[Source] = relationship(back_populates="plate_reads")

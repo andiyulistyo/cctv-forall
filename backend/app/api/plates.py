@@ -43,19 +43,37 @@ def list_plates(
             plate_text=p.plate_text,
             confidence=p.confidence,
             has_image=bool(p.image_path),
+            has_frame=bool(p.frame_path),
             timestamp=p.timestamp,
         )
         for p in rows
     ]
 
 
-@router.get("/{plate_id}/image")
-def plate_image(plate_id: int, token: str = Query(...), db: Session = Depends(get_db)):
-    validate_token(token)
-    p = db.get(PlateRead, plate_id)
-    if not p or not p.image_path:
-        raise HTTPException(404, "No image for this plate")
-    fpath = settings.data_dir / p.image_path
+def _serve(rel_path: str | None, missing: str) -> FileResponse:
+    if not rel_path:
+        raise HTTPException(404, missing)
+    fpath = settings.data_dir / rel_path
     if not fpath.exists():
         raise HTTPException(404, "Image file missing")
     return FileResponse(str(fpath), media_type="image/jpeg")
+
+
+@router.get("/{plate_id}/image")
+def plate_image(plate_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    """The cropped plate -- what the OCR actually read."""
+    validate_token(token)
+    p = db.get(PlateRead, plate_id)
+    if not p:
+        raise HTTPException(404, "No image for this plate")
+    return _serve(p.image_path, "No image for this plate")
+
+
+@router.get("/{plate_id}/frame")
+def plate_frame(plate_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    """The full frame at the moment of the read, with the vehicle boxed."""
+    validate_token(token)
+    p = db.get(PlateRead, plate_id)
+    if not p:
+        raise HTTPException(404, "No frame for this plate")
+    return _serve(p.frame_path, "No frame for this plate")

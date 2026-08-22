@@ -44,6 +44,23 @@ class LineUpdate(BaseModel):
     direction_labels: DirectionLabels | None = None
 
 
+# --- Plate-reading zone ---
+class Zone(BaseModel):
+    """Two opposite corners of a rectangle, normalized 0..1.
+
+    Which corner is which is not fixed: the drawing UI reports wherever the
+    drag started and ended, and the worker sorts them.
+    """
+
+    a: list[float] = Field(..., min_length=2, max_length=2)
+    b: list[float] = Field(..., min_length=2, max_length=2)
+
+
+class ZoneUpdate(BaseModel):
+    # None clears the zone, restoring "read anywhere in the frame".
+    zone: Zone | None = None
+
+
 # --- Sources ---
 class SourceBase(BaseModel):
     name: str
@@ -76,6 +93,7 @@ class SourceUpdate(BaseModel):
 class SourceOut(SourceBase):
     id: int
     line: dict | None = None
+    alpr_zone: dict | None = None
     direction_labels: dict
     status: str
     status_message: str | None = None
@@ -120,6 +138,7 @@ class PlateOut(BaseModel):
     plate_text: str
     confidence: float
     has_image: bool
+    has_frame: bool
     timestamp: datetime
 
     model_config = {"from_attributes": True}

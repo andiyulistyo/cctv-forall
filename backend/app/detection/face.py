@@ -1,9 +1,26 @@
-"""Lightweight face recognition using OpenCV YuNet (detection) + SFace (embedding).
+"""Lightweight face recognition: YuNet (detection) + SFace (embedding).
 
 Self-contained and optional, mirroring the ANPR module (`alpr.py`): if the
 ONNX models cannot be loaded, :attr:`FaceRecognizer.available` is False and the
-worker simply skips face recognition. No heavy dependency is required —
-``cv2.FaceDetectorYN`` and ``cv2.FaceRecognizerSF`` ship with OpenCV (>=4.5.4).
+worker simply skips face recognition.
+
+Two interchangeable backends run the same two models:
+
+* **onnx** — ONNX Runtime (:mod:`onnx_face`), which can use the GPU. On one
+  1280x720 frame with 5 faces: cv2.dnn 86.9 ms, ORT CPU 61.8 ms, ORT CUDA
+  16.0 ms. Preferred whenever onnxruntime is installed.
+* **opencv** — ``cv2.FaceDetectorYN`` / ``cv2.FaceRecognizerSF``, which ship
+  with OpenCV and need no extra dependency. The fallback, and still the only
+  option on a machine without onnxruntime.
+
+⚠️ The two produce **different embeddings**. Given a byte-identical input blob
+their cosine similarity is ~0.93, not 1.0: cv2.dnn's evaluation of SFace
+deviates from ONNX Runtime's (ORT on CPU and on CUDA agree with each other
+exactly, so this is the runtime, not the device). Recognition compares an
+enrolled embedding against a live one, so both must come from the same backend
+— **switching backends means re-enrolling every face**. There is no schema to
+record which backend produced a row, so this is a documented constraint rather
+than an enforced one.
 
 Pipeline:
 - YuNet detects faces and their 5 landmarks (a per-face row of length 15:
@@ -34,6 +51,7 @@ class FaceRecognizer:
         nms_threshold: float = 0.3,
         top_k: int = 5000,
         max_side: int = 1024,
+        backend: str = "auto",
     ):
         # Large images are downscaled to <= max_side before detection: YuNet is
         # trained for modest face scales, so very high-res photos (common at
@@ -42,12 +60,39 @@ class FaceRecognizer:
         self._available = False
         self._detector = None
         self._recognizer = None
+        self._onnx = None
+        self.backend = "none"
+
+        want = (backend or "auto").strip().lower()
+        if want in ("auto", "onnx"):
+            try:
+                from .onnx_face import OnnxFaceBackend
+
+                self._onnx = OnnxFaceBackend(
+                    yunet_model, sface_model, score_threshold, nms_threshold,
+                    top_k, max_side,
+                )
+                self._available = True
+                self.backend = f"onnx[{self._onnx.provider}]"
+                print(f"[Face] backend: {self.backend}")
+                return
+            except Exception as exc:
+                if want == "onnx":
+                    # Explicitly requested: do not silently change the backend,
+                    # because that would invalidate the enrolled embeddings.
+                    print(f"[Face] disabled: FACE_BACKEND=onnx but it failed: {exc}")
+                    self._available = False
+                    return
+                print(f"[Face] onnxruntime unavailable ({exc}); using OpenCV")
+
         try:
             self._detector = cv2.FaceDetectorYN.create(
                 yunet_model, "", (det_size, det_size), score_threshold, nms_threshold, top_k
             )
             self._recognizer = cv2.FaceRecognizerSF.create(sface_model, "")
             self._available = True
+            self.backend = "opencv"
+            print(f"[Face] backend: {self.backend}")
         except Exception as exc:  # pragma: no cover - environment dependent
             print(f"[Face] disabled: could not load YuNet/SFace models: {exc}")
             self._available = False
@@ -64,6 +109,8 @@ class FaceRecognizer:
         """
         if not self._available:
             return []
+        if self._onnx is not None:
+            return self._onnx.detect(frame)
         h, w = frame.shape[:2]
         scale = 1.0
         img = frame
@@ -87,6 +134,8 @@ class FaceRecognizer:
         """Align a detected face and return its 128-D embedding."""
         if not self._available:
             return None
+        if self._onnx is not None:
+            return self._onnx.embed(frame, face_row)
         try:
             aligned = self._recognizer.alignCrop(frame, face_row)
             feat = self._recognizer.feature(aligned)

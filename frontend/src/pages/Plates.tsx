@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { api, Plate, Source } from "../api";
+import { PlateEvidenceModal } from "../components/common";
 
 export default function Plates() {
   const [plates, setPlates] = useState<Plate[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [sourceId, setSourceId] = useState<number | undefined>(undefined);
+  const [evidence, setEvidence] = useState<Plate | null>(null);
 
   const load = async () => {
     setPlates(await api.listPlates(sourceId, 200));
@@ -24,6 +26,7 @@ export default function Plates() {
 
   return (
     <div>
+      <PlateEvidenceModal plate={evidence} onClose={() => setEvidence(null)} />
       <div className="mb-5 flex items-center gap-3">
         <h1 className="text-2xl font-semibold">Plat Nomor</h1>
         <select
@@ -44,9 +47,10 @@ export default function Plates() {
         <table className="w-full text-sm">
           <thead className="bg-slate-900 text-left text-slate-400">
             <tr>
-              <th className="p-3">Gambar</th>
-              <th className="p-3">Plat</th>
+              <th className="p-3">Plat (crop)</th>
               <th className="p-3">Kendaraan</th>
+              <th className="p-3">Nomor</th>
+              <th className="p-3">Kelas</th>
               <th className="p-3">Source</th>
               <th className="p-3">Confidence</th>
               <th className="p-3">Waktu</th>
@@ -66,6 +70,20 @@ export default function Plates() {
                     <span className="text-slate-600">—</span>
                   )}
                 </td>
+                <td className="p-3">
+                  {p.has_frame ? (
+                    <img
+                      src={api.plateFrameUrl(p.id)}
+                      alt="kendaraan"
+                      loading="lazy"
+                      onClick={() => setEvidence(p)}
+                      title="Lihat frame penuh"
+                      className="h-16 w-28 cursor-zoom-in rounded border border-slate-700 object-cover hover:border-sky-500"
+                    />
+                  ) : (
+                    <span className="text-slate-600">—</span>
+                  )}
+                </td>
                 <td className="p-3 font-mono text-base font-semibold tracking-wider">
                   {p.plate_text}
                 </td>
@@ -77,7 +95,7 @@ export default function Plates() {
             ))}
             {plates.length === 0 && (
               <tr>
-                <td colSpan={6} className="p-8 text-center text-slate-500">
+                <td colSpan={7} className="p-8 text-center text-slate-500">
                   Belum ada data plat nomor.
                 </td>
               </tr>

@@ -30,10 +30,12 @@ def purge_old_data() -> dict:
             select(PlateRead).where(PlateRead.timestamp < cutoff)
         ).all()
         for pr in old_plates:
-            if pr.image_path:
-                fpath = settings.data_dir / pr.image_path
+            # Both the crop and the full-frame evidence image.
+            for rel in (pr.image_path, pr.frame_path):
+                if not rel:
+                    continue
                 try:
-                    fpath.unlink(missing_ok=True)
+                    (settings.data_dir / rel).unlink(missing_ok=True)
                 except Exception:
                     pass
         removed_plates = db.execute(

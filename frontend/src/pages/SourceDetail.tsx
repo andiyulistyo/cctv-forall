@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, CountsResponse, Plate, Sighting, Source, SourceStats } from "../api";
-import { StatusBadge } from "../components/common";
+import { PlateEvidenceModal, StatusBadge } from "../components/common";
 import LineDrawCanvas from "../components/LineDrawCanvas";
+import ZoneDrawCanvas from "../components/ZoneDrawCanvas";
 
-type Tab = "live" | "line";
+type Tab = "live" | "line" | "zone";
 
 export default function SourceDetail() {
   const { id } = useParams();
@@ -14,6 +15,7 @@ export default function SourceDetail() {
   const [plates, setPlates] = useState<Plate[]>([]);
   const [sightings, setSightings] = useState<Sighting[]>([]);
   const [tab, setTab] = useState<Tab>("live");
+  const [evidence, setEvidence] = useState<Plate | null>(null);
 
   const loadSource = async () => setSource(await api.getSource(sourceId));
 
@@ -60,6 +62,7 @@ export default function SourceDetail() {
 
   return (
     <div>
+      <PlateEvidenceModal plate={evidence} onClose={() => setEvidence(null)} />
       <div className="mb-4 flex items-center gap-3">
         <h1 className="text-2xl font-semibold">{source.name}</h1>
         <StatusBadge status={source.status} />
@@ -87,6 +90,14 @@ export default function SourceDetail() {
             >
               Atur Garis Hitung
             </button>
+            {source.alpr_enabled && (
+              <button
+                onClick={() => setTab("zone")}
+                className={`rounded px-3 py-1.5 text-sm ${tab === "zone" ? "bg-sky-600" : "bg-slate-800"}`}
+              >
+                Atur Zona Baca Plat
+              </button>
+            )}
           </div>
 
           {tab === "live" ? (
@@ -102,8 +113,10 @@ export default function SourceDetail() {
               </div>
               {running && source.stats ? <StreamStats stats={source.stats} /> : null}
             </div>
-          ) : (
+          ) : tab === "line" ? (
             <LineDrawCanvas source={source} onSaved={loadSource} />
+          ) : (
+            <ZoneDrawCanvas source={source} onSaved={loadSource} />
           )}
         </div>
 
@@ -140,6 +153,12 @@ export default function SourceDetail() {
 
           <section className="rounded-lg border border-slate-800 bg-slate-900 p-4">
             <h2 className="mb-3 font-medium">Plat Nomor Terbaru</h2>
+            {source.alpr_enabled && !source.alpr_zone && (
+              <p className="mb-2 text-xs text-amber-400">
+                Zona baca belum diatur — plat dicoba dibaca di seluruh frame, termasuk saat
+                kendaraan masih terlalu jauh. Buka tab "Atur Zona Baca Plat".
+              </p>
+            )}
             {plates.length === 0 ? (
               <p className="text-sm text-slate-500">Belum ada plat terbaca.</p>
             ) : (
@@ -150,7 +169,11 @@ export default function SourceDetail() {
                       <img
                         src={api.plateImageUrl(p.id)}
                         alt={p.plate_text}
-                        className="h-8 w-20 rounded border border-slate-700 object-cover"
+                        onClick={() => p.has_frame && setEvidence(p)}
+                        title={p.has_frame ? "Lihat kendaraan" : undefined}
+                        className={`h-8 w-20 rounded border border-slate-700 object-cover ${
+                          p.has_frame ? "cursor-zoom-in hover:border-sky-500" : ""
+                        }`}
                       />
                     )}
                     <span className="font-mono font-semibold tracking-wider">{p.plate_text}</span>
@@ -213,8 +236,19 @@ function StreamStats({ stats }: { stats: SourceStats }) {
     ["tampil", stats.publish_fps, "frame per detik yang dikirim ke browser"],
     ["dibuang", stats.dropped_fps, "frame dibuang karena tidak terkejar"],
   ];
+  // Only call the source slow when it is genuinely ahead of us. On a chunked
+  // source (HLS/YouTube) the decoder is throttled by the buffer, so a slow
+  // detection loop drags capture_fps down with it and looks identical to a slow
+  // camera -- except that detect_fps sits right on top of it.
+  const detect = stats.detect_fps ?? 0;
   const slowSource =
-    stats.capture_fps !== undefined && stats.capture_fps < 5;
+    stats.capture_fps !== undefined && stats.capture_fps < 5 && detect > stats.capture_fps * 0.8;
+  const slowPipeline =
+    stats.capture_fps !== undefined &&
+    stats.capture_fps >= 5 &&
+    detect > 0 &&
+    detect >= stats.capture_fps * 0.95 &&
+    (stats.dropped_fps ?? 0) > 1;
   return (
     <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
       {items.map(([label, value, title]) =>
@@ -227,6 +261,12 @@ function StreamStats({ stats }: { stats: SourceStats }) {
       {slowSource ? (
         <span className="text-amber-400">
           sumber lambat — video tersendat dari sisi kamera/jaringan, bukan dari server
+        </span>
+      ) : null}
+      {slowPipeline ? (
+        <span className="text-amber-400">
+          pemrosesan tidak terkejar — frame lama dibuang agar tetap real-time; naikkan
+          FRAME_STRIDE atau pakai model lebih kecil
         </span>
       ) : null}
     </div>
