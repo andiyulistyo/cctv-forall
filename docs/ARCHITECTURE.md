@@ -489,6 +489,135 @@ Kelas COCO yang dipakai: `person` (0), `car` (2), `motorcycle` (3), `bus` (5),
 
 ---
 
+## 10. Rekomendasi hardware
+
+Rekomendasi di bawah mengikuti jalur akselerasi yang **benar-benar dipakai
+library di proyek ini** — torch, OpenVINO, ONNX Runtime, EasyOCR — bukan
+spesifikasi umum. Empat mesin di tabel pertama sudah **diukur** dengan
+`scripts/benchmark.py`; baris yang bertanda *(ekstrapolasi)* dihitung dari angka
+tersebut, bukan diukur langsung.
+
+### Tiga hal yang sebenarnya menentukan
+
+1. **Jumlah stream dibatasi VRAM, bukan kecepatan GPU.** Arsitekturnya satu
+   proses per source, dan tiap proses membawa konteks CUDA-nya sendiri: 1166 MiB
+   sebelum model apa pun di-load, sementara modelnya sendiri hanya ~300 MB.
+   Kartu 8 GB menampung sedikit stream bukan karena kurang cepat, tapi karena
+   kehabisan VRAM.
+2. **Pada `imgsz=640`, hanya ~4 dari ~11 ms yang benar-benar inferensi.**
+   Sisanya letterbox, NMS, dan overhead Python di ultralytics — semuanya di CPU.
+   Itu sebabnya `yolo11m` tidak lebih lambat dari `yolo11s` di RTX 5070, dan
+   sebabnya CPU lemah tetap jadi rem walau GPU-nya kencang.
+3. **Face recognition adalah langkah termahal bila diaktifkan** — 86,9 ms, sekitar
+   8× biaya deteksi kendaraan. Kalau `FACE_ENABLED=true`, GPU memberi keuntungan
+   jauh lebih besar di sini (86,9 → 16,0 ms) daripada di deteksi kendaraan.
+
+### Mesin yang sudah diukur
+
+Semua angka: input 1080p, `imgsz=640`, deteksi saja.
+
+| Mesin | Jalur inferensi | Model | Hasil |
+|---|---|---|---:|
+| Mac mini M4 Pro (8P + 4E) | CoreML / Neural Engine | yolo11n | 113 fps · 8,9 ms |
+| Mac mini M4 Pro | `mps` (Metal) | yolo11s | 91 fps · 11,0 ms |
+| RTX 5070 Laptop 8 GB + Ryzen 9 8940HX | `cuda` fp16 | yolo11m | 90,5 fps |
+| RTX 5070 Laptop 8 GB | `cuda` fp16 | yolo11s | 84,1 fps |
+| Ryzen 7 PRO 7840U (8C/16T, Zen 4) | `intel:cpu` OpenVINO INT8 | yolo11n | 73 fps · 55 fps saat dipin 2 core |
+| Ryzen 7 PRO 7840U | `intel:cpu` OpenVINO INT8 | yolo11s | 44 fps |
+| Core i7 gen-7 (2C/4T, HD Graphics) | `intel:gpu` OpenVINO FP16 | yolo11n, imgsz 480 | batas bawah yang masih layak |
+
+Perhatikan baris Ryzen: **yang menentukan adalah fps saat dipin ke jatah
+core-nya** (55 fps), bukan fps saat memakai seluruh CPU (73 fps) — di produksi
+setiap worker hanya dapat `physical_cores / EXPECTED_STREAMS`.
+
+### Pilih berdasarkan beban
+
+```mermaid
+flowchart TB
+    Q1{"ANPR dan face recognition<br/>keduanya aktif?"}
+    Q2{"Berapa stream bersamaan?"}
+    Q3{"Sudah punya Mac<br/>Apple Silicon?"}
+    Q4{"Ada slot GPU diskrit<br/>dan anggarannya?"}
+
+    NV8["NVIDIA 8 GB — RTX 4060 / 5060 / 5070<br/>2-4 stream · yolo11m fp16 · FRAME_STRIDE 1<br/>OCR_DEVICE=cuda · FACE_BACKEND=onnx"]
+    NV16["NVIDIA 12-16 GB<br/>6-8 stream · CPU minimal 12 core fisik"]
+    MAC["Apple M4 / M4 Pro<br/>mps atau CoreML/ANE · yolo11s<br/>FFMPEG_HWACCEL=videotoolbox"]
+    ZEN["CPU 8 core Zen 4 / Intel setara<br/>OpenVINO CPU INT8 · yolo11n · FRAME_STRIDE 2"]
+    SMALL["4 core fisik atau iGPU Intel Gen9+<br/>OpenVINO · yolo11n INT8 · imgsz 480-640<br/>FRAME_STRIDE 3 · ANPR seperlunya"]
+
+    Q1 -->|"ya"| Q2
+    Q1 -->|"tidak — hanya hitung kendaraan"| Q3
+    Q2 -->|"sampai 4"| NV8
+    Q2 -->|"6 atau lebih"| NV16
+    Q3 -->|"ya"| MAC
+    Q3 -->|"tidak"| Q4
+    Q4 -->|"ya"| NV8
+    Q4 -->|"tidak, 4 stream"| ZEN
+    Q4 -->|"tidak, 1-2 stream"| SMALL
+```
+
+| Skala | CPU | Akselerator | RAM | Setelan kunci |
+|---|---|---|---|---|
+| 1–2 stream, anggaran minimum | 4 core fisik | iGPU Intel Gen9+ (`intel:gpu`) atau plugin CPU OpenVINO | 8 GB | `yolo11n` INT8, imgsz 480–640, `FRAME_STRIDE=3` |
+| 4 stream, tanpa GPU diskrit | 8 core fisik Zen 4 / Intel setara (AVX-512, VNNI) | plugin CPU OpenVINO | 16 GB | `yolo11n` INT8, `FRAME_STRIDE=2`, `EXPECTED_STREAMS=4` |
+| 4–10 stream, hemat daya | Apple M4 / M4 Pro | `mps` atau CoreML/ANE | 16–24 GB unified | `yolo11s`, `FRAME_STRIDE=2`, hwaccel VideoToolbox |
+| 2–4 stream + ANPR & wajah | ≥8 core fisik | NVIDIA 8 GB | 16–32 GB | `yolo11m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
+| 6–8 stream + ANPR & wajah *(ekstrapolasi)* | ≥12 core fisik | NVIDIA 12–16 GB | 32 GB | sama, `EXPECTED_STREAMS` disesuaikan |
+
+### Anggaran VRAM per stream
+
+Terukur lewat `torch.cuda.mem_get_info()` pada RTX 5070 Laptop:
+
+| Tahap | VRAM |
+|---|---:|
+| Konteks CUDA kosong (per proses) | 1166 MiB |
+| + `yolo11m` fp16 | 1330 MiB |
+| + EasyOCR + detektor plat | 1388 MiB |
+| Saat memproses frame | ~1482 MiB |
+
+Anggarkan **~1,5 GB per stream**, lalu sisakan ruang untuk desktop. Praktisnya:
+8 GB → 2 stream lapang atau 4 stream mepet; 12 GB → ~6 stream; 16 GB → ~8 stream
+*(dua angka terakhir ekstrapolasi)*. Di atas itu yang dibutuhkan adalah
+inference server bersama, bukan kartu lebih besar — konteks CUDA per proses
+tidak bisa ditawar lewat konfigurasi. `Detector.trim_memory()` berjalan tiap 120
+detik dan mengembalikan ~100 MiB per worker.
+
+### RAM sistem, storage, dan jaringan
+
+- **RAM: ~570 MB per stream** pada 1080p (terukur di M4 Pro), di luar model.
+- **Jitter buffer** untuk HLS/YouTube memakan ±83 MB per detik pada 720p,
+  dikalikan `CAPTURE_BUFFER_SECONDS` (default 2). Sumber RTSP tidak memakai ini.
+- **Storage: SSD**, karena SQLite berjalan mode WAL. Pertumbuhannya didorong
+  ANPR: tiap plat terbaca menyimpan crop plat **dan** satu frame penuh
+  (`ALPR_SAVE_FRAME=true`). `RETENTION_DAYS=7` yang menahan pertumbuhan itu —
+  naikkan retensi berarti naikkan kapasitas disk secara proporsional.
+- **Jaringan**: RTSP dipaksa lewat TCP (`RTSP_TRANSPORT_TCP=true`) karena UDP
+  menghasilkan jauh lebih banyak frame rusak dari CCTV.
+
+### Decoding video
+
+Decoding H.264/HEVC dipindahkan ke media engine lewat `FFMPEG_HWACCEL=auto` —
+D3D11VA di Windows, VAAPI di Linux, VideoToolbox di macOS — sehingga core CPU
+bebas untuk inferensi. Ini berlaku di semua tingkatan hardware di atas dan tidak
+menuntut komponen khusus.
+
+### Yang tidak perlu dibeli
+
+- **GPU kelas atas demi TensorRT.** Hanya ~4 dari ~11 ms per frame yang berupa
+  inferensi; TensorRT hanya bisa memangkas bagian itu. Ukur dengan
+  `scripts/benchmark.py` sebelum mengeluarkan uang.
+- **Kartu demi NVDEC.** FFmpeg yang dibundel `opencv-python` tidak punya decoder
+  NVDEC sama sekali — scan DLL-nya memberi nol kecocokan untuk `h264_cuvid`.
+  D3D11VA sudah menangani decoding.
+- **CPU dengan banyak thread logis tapi sedikit core fisik.** `runtime.py`
+  sengaja menghitung **core fisik**; SMT sibling justru membuat worker rebutan.
+
+⚠️ **Kecocokan wheel torch.** RTX seri 50 adalah sm_120 (Blackwell) dan
+memerlukan wheel CUDA 13; wheel cu128 ke bawah tidak punya kernel untuknya.
+Kartu lama tetap didukung oleh wheel yang sama.
+
+---
+
 ## Membuka sebagai HTML
 
 Tiga cara, dari yang paling cepat:
