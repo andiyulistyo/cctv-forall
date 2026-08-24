@@ -21,7 +21,8 @@ from sqlalchemy import select
 
 from ..config import settings
 from ..database import SessionLocal
-from ..models import (
+from ..models import (  # noqa: F401
+    DETECTION_CLASSES,
     VEHICLE_CLASSES,
     CountEvent,
     EnrolledFace,
@@ -587,6 +588,7 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             capture_min_width=settings.alpr_capture_min_width,
             zone=source_cfg.get("alpr_zone"),
             zone_min_overlap=settings.alpr_zone_min_overlap,
+            person_sink=_person_sink(source_id, fstate),
             save_frame=settings.alpr_save_frame,
             stationary_seconds=settings.alpr_stationary_seconds,
             reid_gap_seconds=settings.alpr_reid_gap_seconds,
@@ -693,12 +695,15 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
                     shared.set_counts(source_id, totals)
                     preview.set_counts(totals)
 
-            # ANPR for vehicles: hand the crops off and move on.
-            if plate_reader is not None:
-                plate_reader.submit(full_frame, detections, detect_scale)
-
-            # Face recognition
+            # Face recognition. Runs before the ANPR hand-off, not after, so
+            # a person captured from this frame can be given the name the
+            # recognizer just put to the face inside their box. Nothing else
+            # depends on the order of these two.
             current_faces = _run_faces(fstate, frame, source_id) if fstate is not None else []
+
+            # ANPR for vehicles, plus captures for whatever else is in the zone.
+            if plate_reader is not None:
+                plate_reader.submit(full_frame, detections, detect_scale, current_faces)
 
             preview.set_overlay(
                 detections,
@@ -800,15 +805,46 @@ def _capture_classes(configured: str) -> tuple[str, ...]:
     Unlike :func:`_alpr_classes` an empty setting means *none*, not "all": this
     is an opt-in addition, and defaulting it to every class would start writing
     a row for every vehicle that crosses the zone.
+
+    Validated against DETECTION_CLASSES rather than VEHICLE_CLASSES, because
+    "person" belongs here too: a capture asks whether something came through the
+    zone, and that question is not only about vehicles. A person capture is
+    written as a face sighting rather than a plate row -- see
+    :func:`_person_sink`.
     """
     wanted = [s.strip().lower() for s in configured.split(",") if s.strip()]
-    unknown = [n for n in wanted if n not in VEHICLE_CLASSES]
+    unknown = [n for n in wanted if n not in DETECTION_CLASSES]
     if unknown:
         print(
             "[ALPR] ignoring unknown ALPR_CAPTURE_CLASSES entries: "
             f"{', '.join(unknown)}"
         )
-    return tuple(n for n in wanted if n in VEHICLE_CLASSES)
+    return tuple(n for n in wanted if n in DETECTION_CLASSES)
+
+
+def _face_for_person(box, faces) -> tuple[str | None, float] | None:
+    """The face belonging to this person box, or None if none sits inside it.
+
+    Takes the faces the frame has *already* been scanned for rather than running
+    the recognizer again: YuNet and SFace have run on this frame by the time a
+    capture is queued, so a second pass would buy nothing and cost another
+    17-33 ms. It also keeps the recognizer on one thread, which is where the
+    ONNX sessions want to stay.
+
+    A named match wins over an unnamed one even if the unnamed face scored
+    higher -- an identity is the answer to "who was this", a bare detection is
+    not.
+    """
+    x1, y1, x2, y2 = box
+    inside = [
+        (name, sim)
+        for (fx, fy, fw, fh, name, sim) in faces
+        if x1 <= fx + fw / 2.0 <= x2 and y1 <= fy + fh / 2.0 <= y2
+    ]
+    if not inside:
+        return None
+    inside.sort(key=lambda t: (t[0] is not None, t[1]), reverse=True)
+    return inside[0]
 
 
 class _PlateReader:
@@ -851,6 +887,7 @@ class _PlateReader:
         capture_min_width: int = 0,
         zone: dict | None = None,
         zone_min_overlap: float = 0.5,
+        person_sink=None,
         save_frame: bool = False,
         stationary_seconds: float = 20.0,
         reid_gap_seconds: float = 4.0,
@@ -875,6 +912,10 @@ class _PlateReader:
             self._capture_classes = ()
         self._capture_min_width = max(0, capture_min_width)
         self._zone_min_overlap = min(1.0, max(0.0, zone_min_overlap))
+        # Where a person capture goes. Vehicles are plate rows; a person is a
+        # face sighting, and the worker owns that decision -- this class only
+        # decides *whether* something in the zone is worth recording.
+        self._person_sink = person_sink
         self._save_frame = save_frame
         # Last exception type reported, so a persistent fault is logged once
         # rather than once per vehicle per frame.
@@ -898,14 +939,24 @@ class _PlateReader:
         self._thread = threading.Thread(target=self._run, name="alpr", daemon=True)
         self._thread.start()
 
-    def submit(self, frame, detections, scale: float = 1.0) -> None:
+    def submit(self, frame, detections, scale: float = 1.0, faces=()) -> None:
         """Queue plate crops for the vehicles worth another attempt.
 
         ``frame`` is the full-resolution frame (plate text has to stay legible)
         and ``scale`` maps detection boxes from the downscaled detection frame
         onto it.
+
+        ``faces`` is what the face recognizer already found on this frame, as
+        ``(x, y, w, h, name, similarity)`` in *detection*-frame coordinates. It
+        is only used to put a name on a person capture; nothing else here reads
+        it, and leaving it empty simply means captures go in unidentified.
         """
         now = time.monotonic()
+        # Same space as the boxes below, so the two can be compared at all.
+        faces = [
+            (fx * scale, fy * scale, fw * scale, fh * scale, name, sim)
+            for (fx, fy, fw, fh, name, sim) in faces
+        ] if scale != 1.0 else list(faces)
         for det in detections:
             readable = det.class_name in self._classes
             capturable = det.class_name in self._capture_classes
@@ -924,7 +975,7 @@ class _PlateReader:
             if vehicle.vid in self._pending:
                 continue
             if capturable and not readable:
-                self._maybe_capture(vehicle, det, frame, (x1, y1, x2, y2), now)
+                self._maybe_capture(vehicle, det, frame, (x1, y1, x2, y2), now, faces)
                 continue
             if vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
                 continue  # already read well; spend the budget elsewhere
@@ -967,7 +1018,7 @@ class _PlateReader:
             self._offer(
                 vehicle.vid,
                 ("read", vehicle.vid, det.track_id, det.class_name, crop, snapshot,
-                 (x1, y1, x2, y2)),
+                 (x1, y1, x2, y2), None),
             )
 
         # Labels follow the vehicle, not the id it happens to carry: a
@@ -975,7 +1026,7 @@ class _PlateReader:
         self.plates = self._vehicles.labels()
         self._vehicles.prune(now)
 
-    def _maybe_capture(self, vehicle, det, frame, box, now: float) -> None:
+    def _maybe_capture(self, vehicle, det, frame, box, now: float, faces=()) -> None:
         """Record a capture-class vehicle the first time it is seen in zone.
 
         Runs the same gauntlet as a plate read -- zone, size, parked -- and for
@@ -1017,7 +1068,7 @@ class _PlateReader:
         if self._offer(
             vehicle.vid,
             ("capture", vehicle.vid, det.track_id, det.class_name, crop, snapshot,
-             (x1, y1, x2, y2)),
+             (x1, y1, x2, y2), _face_for_person((x1, y1, x2, y2), faces)),
             evict=False,
         ):
             vehicle.captured = True
@@ -1086,10 +1137,10 @@ class _PlateReader:
             job = self._queue.get()
             if job is None:  # shutdown
                 return
-            kind, vid, tid, class_name, crop, snapshot, box = job
+            kind, vid, tid, class_name, crop, snapshot, box, match = job
             try:
                 if kind == "capture":
-                    self._do_capture(vid, tid, class_name, crop, snapshot, box)
+                    self._do_capture(vid, tid, class_name, crop, snapshot, box, match)
                     continue
                 result = self._alpr.read_plate(crop)
                 vehicle = self._vehicles.get(vid)
@@ -1120,7 +1171,7 @@ class _PlateReader:
             finally:
                 self._pending.discard(vid)
 
-    def _do_capture(self, vid, tid, class_name, crop, snapshot, box) -> None:
+    def _do_capture(self, vid, tid, class_name, crop, snapshot, box, match=None) -> None:
         """Write the capture row, then try for a plate only if nothing is waiting.
 
         The row goes in first and unconditionally: the capture is the point, and
@@ -1129,6 +1180,15 @@ class _PlateReader:
         mechanism the plate path already uses to replace a poor read with a
         better one -- so a motorcycle produces one row either way.
         """
+        if class_name == "person":
+            # A person has no plate to read and no plate row to live in. Hand it
+            # to the worker, which files it as a face sighting under whatever
+            # name the recognizer had already put to the face inside this box.
+            if self._person_sink is not None:
+                name, sim = match if match is not None else (None, 0.0)
+                self._person_sink(name, sim, crop, snapshot, box)
+            return
+
         # Detached before the write, because _persist_plate draws the evidence
         # box onto the snapshot and this crop is a view into it -- a 2 px line
         # straight across the edge of what OCR is about to be shown.
@@ -1354,6 +1414,24 @@ class _FaceState:
         self.names: list[str] = []
         self.last_reload = 0.0
         self.last_logged: dict[str, float] = {}
+        # last_logged is now read from two threads -- the detection loop, via
+        # _run_faces, and the ANPR thread, via a person capture. Both ask the
+        # same question about the same identity, and they have to get one
+        # answer between them or a recognized person walking through the zone
+        # is filed twice.
+        self._log_lock = threading.Lock()
+
+    def claim_log(self, key: str, now: float) -> bool:
+        """Claim the right to log ``key`` now, or False if it is still cooling.
+
+        Claiming and checking are one step on purpose: two threads that both
+        looked before either wrote would both see a stale timestamp.
+        """
+        with self._log_lock:
+            if now - self.last_logged.get(key, 0.0) < self.cooldown:
+                return False
+            self.last_logged[key] = now
+            return True
 
     def reload_gallery(self) -> None:
         db = SessionLocal()
@@ -1391,12 +1469,39 @@ def _run_faces(fstate: "_FaceState", frame, source_id: int) -> list:
         if name is None and not fstate.log_unknown:
             continue
         key = name or "__unknown__"
-        now = time.time()
-        if now - fstate.last_logged.get(key, 0.0) >= fstate.cooldown:
-            fstate.last_logged[key] = now
+        if fstate.claim_log(key, time.time()):
             crop = frame[max(0, y): y + h, max(0, x): x + w]
             _persist_sighting(source_id, name, sim, crop)
     return results
+
+
+def _person_sink(source_id: int, fstate: "_FaceState | None"):
+    """Build the callback that files a person captured in the ANPR zone.
+
+    A person capture is a face sighting: it answers "who came through here",
+    which is the question the Wajah page already exists to answer. It is filed
+    with the name the recognizer put to the face inside the person's box, or
+    with no name at all when no face was turned to the camera -- which is the
+    case the frame-wide face pass cannot record, because a face it never
+    detected is a face it never logs.
+
+    The one thing it must not do is duplicate that frame-wide pass. Both share
+    ``_FaceState.claim_log``, so for an identity the face pass would already
+    have logged, whichever gets there first wins and the other stands down. An
+    *unnamed* capture skips the claim, because with FACE_LOG_UNKNOWN off there
+    is nothing on the other side to collide with -- and each person is captured
+    once in their own right anyway, via ``Vehicle.captured``.
+    """
+
+    def sink(name: str | None, similarity: float, crop, snapshot, box) -> None:
+        contested = name is not None or (fstate is not None and fstate.log_unknown)
+        if contested and fstate is not None and not fstate.claim_log(
+            name or "__unknown__", time.time()
+        ):
+            return
+        _persist_sighting(source_id, name, similarity, crop)
+
+    return sink
 
 
 def _persist_sighting(source_id: int, name: str | None, similarity: float, crop: np.ndarray) -> None:

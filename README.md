@@ -592,6 +592,89 @@ Kelas yang sudah ada di `ALPR_CLASSES` tidak ikut di-capture: kelas itu sudah
 punya jatah percobaan penuh, dan merekamnya juga berarti satu baris untuk
 setiap kendaraan yang masuk zona.
 
+#### Orang di zona ANPR
+
+`person` boleh ada di `ALPR_CAPTURE_CLASSES` dan lewat gerbang yang sama persis
+— zona, ambang lebar, sekali per orang lewat `VehicleRegistry`. Yang berbeda
+hanya tujuannya: **orang ditulis sebagai face sighting, bukan baris plat**, jadi
+muncul di halaman Wajah bersama penampakan yang sudah ada.
+
+Namanya diambil dari face recognition yang **sudah berjalan di frame itu**.
+YuNet dan SFace sudah memindai frame tersebut sebelum capture di-antre, jadi
+yang dilakukan hanya mencocokkan: wajah yang titik tengahnya berada di dalam
+kotak orang itu adalah wajahnya. Tidak ada inferensi tambahan, tidak ada model
+tambahan, dan recognizer tetap di satu thread — tempat sesi ONNX-nya memang
+ingin berada. Wajah bernama menang atas wajah tak bernama meski skornya lebih
+rendah; sebuah identitas menjawab "siapa tadi", deteksi kosong tidak.
+
+Orang yang wajahnya tidak menghadap kamera **tetap tercatat**, tanpa nama. Itu
+justru kemampuan yang tidak dimiliki pemindaian wajah se-frame: wajah yang tidak
+pernah terdeteksi tidak pernah dicatat, jadi orang lewat tanpa menoleh selama
+ini hilang tanpa jejak.
+
+Yang harus dijaga adalah tidak menggandakan pemindaian se-frame itu. Keduanya
+memakai `_FaceState.claim_log` yang sama, jadi untuk identitas yang memang akan
+dicatat oleh jalur lama, siapa pun yang lebih dulu sampai yang menang dan yang
+lain mundur. Capture **tanpa nama** melewati klaim itu, karena dengan
+`FACE_LOG_UNKNOWN=false` tidak ada apa pun di seberang untuk ditabrak.
+
+Biaya memori: **nol**. `person` sudah ikut di `ENABLED_CLASSES` dan keluar dari
+forward pass YOLO yang sama dengan mobil, dan face recognition memang sudah
+berjalan. Terukur di RTX 5070 Laptop, di atas detector yang sedang jalan,
+seluruh pipeline wajah (YuNet + SFace, ONNX/CUDA) memakai **+194 MiB VRAM
+(+13,1%)** dan **+542 MiB RSS (+29,5%)** — 2,38% dari kartu 8 GB — dan itu biaya
+yang sudah dibayar sebelum fitur ini ada. Waktunya 17,0 ms/frame tanpa wajah di
+layar, 33,2 ms saat 5 wajah terdeteksi dan di-embed.
+
+### Satu kendaraan, satu baris
+
+Dua hal yang dulu membuat satu mobil tercatat berkali-kali dengan kelas yang
+berganti-ganti. Keduanya terlihat pada satu taksi yang keluar gang di Kamera 20:
+empat baris dalam tujuh detik, `B1327SLC` sebagai **Truk**, lalu **Mobil**, lalu
+**Truk** lagi.
+
+**1. NMS per-kelas meloloskan satu objek dua kali.** Ultralytics secara default
+menjalankan NMS di dalam masing-masing kelas, jadi dua kotak yang tidak sepakat
+soal *apa* benda itu tidak pernah saling menekan. Pada frame taksi tadi:
+
+```
+truck 0.57  [130, 389, 513, 712]
+car   0.48  [130, 387, 512, 712]     <- objek yang sama, beda dua piksel
+```
+
+ByteTrack melacak keduanya, garis hitung menghitung keduanya, dan ANPR membaca
+plat yang sama dua kali dengan dua kelas berbeda. `Detector.track()` sekarang
+memakai `agnostic_nms=True`, jadi NMS menekan lintas kelas. Ambangnya 0.7 IoU —
+jauh di atas irisan pengendara dengan motornya (diuji pada frame asli: `person`
+0.89 dan `motorcycle` 0.73 dua-duanya lolos), jadi kelas yang memang wajar
+bertumpuk tidak terpengaruh.
+
+**2. Zona ANPR diuji lewat satu titik.** Yang dipakai dulu adalah titik
+tengah-bawah kotak, tempat kendaraan menyentuh jalan. Diukur pada taksi yang
+sama, terhadap zona yang digambar operator:
+
+| Kotak di dalam zona | Aturan titik | Hasil |
+|---|---|---|
+| 96% | **di luar** (roda lewat sedikit dari batas bawah) | dilewati |
+| 44% | di dalam | dibaca |
+| 19% | di dalam | dibaca, tercatat |
+| 5% | di dalam | dibaca, tercatat |
+
+Jadi frame di mana mobilnya benar-benar berada di zona justru dibuang, sementara
+tiga frame saat ia sudah hampir keluar yang tercatat. Sebuah titik tidak bisa
+menyatakan "sebagian besar ada di zona", padahal itu pertanyaannya. Sekarang
+yang diukur adalah **berapa bagian kotak kendaraan yang jatuh di dalam zona**
+(`ALPR_ZONE_MIN_OVERLAP`, default 0.5). Alasan lama memilih titik-bawah tetap
+terjaga — titik tengah kotak makin tinggi makin jangkung kendaraannya, sehingga
+bus satu lajur di sebelah bisa ikut lolos — karena bus itu pun irisannya dengan
+zona kecil.
+
+**3. Jaring terakhir di level teks.** `ALPR_DUPLICATE_WINDOW_SECONDS=60`
+sekarang menyala. `VehicleRegistry` hanya bisa menyatukan kendaraan lewat IoU,
+dan itu memang gagal untuk kendaraan cepat: track 215, 220 dan 223 pada taksi
+tadi kotaknya sudah tidak beririsan sama sekali. Ketiganya membaca teks yang
+sama persis, jadi jaring inilah yang menangkapnya.
+
 ### Kenapa `FFMPEG_HWACCEL` tetap `auto`, bukan `cuda`
 
 Jangan set `cuda`. FFmpeg yang dibundel di dalam `opencv-python`
@@ -829,7 +912,7 @@ memang bisa berhasil.
 | `ALPR_ATTEMPT_INTERVAL` | 3 | jalankan OCR tiap N percobaan (1 = tiap frame deteksi) |
 | `ALPR_CLASSES` | `car,truck,bus` | kelas yang platnya dibaca; motor sengaja tidak termasuk |
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
-| `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, platnya terbaca atau tidak; isi `motorcycle` untuk motor |
+| `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, terbaca/dikenali atau tidak; `motorcycle,person` |
 | `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
 | `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum dibaca/di-capture |
 | `ALPR_SAVE_FRAME` | true | simpan 1 frame penuh (kendaraan dikotaki) per plat terbaca |

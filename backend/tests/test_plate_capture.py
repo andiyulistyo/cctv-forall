@@ -91,8 +91,12 @@ def reader(**kw) -> _PlateReader:
     # every test here is about which jobs are offered, and on what terms.
     r.offered = []
 
+    r.captured_match = None
+
     def record(vid, job, evict=True):
         r.offered.append((job[0], vid, evict))
+        if job[0] == "capture":
+            r.captured_match = job[7]
         return True          # _offer reports whether the queue took the job
 
     r._offer = record
@@ -230,12 +234,12 @@ def test_a_dropped_capture_is_retried_not_lost():
         # Park the worker thread inside a read, then fill what is left. The
         # thread pulls one job the moment it is queued, so "maxsize puts" is
         # not the same as "queue full" -- push until it says so itself.
-        r._queue.put_nowait(("read", 900, 900, "car", None, None, None))
+        r._queue.put_nowait(("read", 900, 900, "car", None, None, None, None))
         assert alpr.entered.wait(timeout=5), "worker thread never started its job"
         n = 0
         while True:
             try:
-                r._queue.put_nowait(("read", 910 + n, 910 + n, "car", None, None, None))
+                r._queue.put_nowait(("read", 910 + n, 910 + n, "car", None, None, None, None))
                 n += 1
             except queue.Full:
                 break
@@ -305,6 +309,186 @@ def test_zone_min_overlap_is_configurable():
     assert not reader(zone=ALLEY_ZONE, zone_min_overlap=0.5)._in_zone(f, box)
     assert reader(zone=ALLEY_ZONE, zone_min_overlap=0.1)._in_zone(f, box)
     print("OK zone_min_overlap_is_configurable")
+
+
+# ---------------------------------------------------------------- person
+def person(track_id=3, x1=600, y1=440, x2=700, y2=620):
+    """A person-shaped box standing in the bottom-half zone."""
+    return Detection(track_id, "person", 0.9, x1, y1, x2, y2)
+
+
+def face(x=630, y=450, w=30, h=30, name="BUDI", sim=0.88):
+    """One entry as _run_faces returns it: (x, y, w, h, name, similarity)."""
+    return (x, y, w, h, name, sim)
+
+
+def person_reader(**kw):
+    r = reader(capture_classes=("motorcycle", "person"), **kw)
+    r.sunk = []
+    r._person_sink = lambda name, sim, crop, snap, box: r.sunk.append((name, sim))
+    return r
+
+
+def test_person_in_the_zone_is_captured():
+    r = person_reader()
+    r.submit(frame(), [person()])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+    print("OK person_in_the_zone_is_captured")
+
+
+def test_person_outside_the_zone_is_never_captured():
+    """Same rule as every other capture: in the zone, or not at all."""
+    r = person_reader()
+    r.submit(frame(), [person(y1=60, y2=240)])   # above the bottom-half zone
+    assert r.offered == [], r.offered
+    print("OK person_outside_the_zone_is_never_captured")
+
+
+def test_person_capture_carries_the_recognized_name():
+    """The face the frame was already scanned for gets attached to the capture."""
+    r = person_reader()
+    r.submit(frame(), [person()], faces=[face()])
+    job_match = r.captured_match
+    assert job_match == ("BUDI", 0.88), job_match
+    print("OK person_capture_carries_the_recognized_name")
+
+
+def test_person_capture_with_no_face_is_still_captured():
+    """Nobody turned to the camera is still somebody who came through."""
+    r = person_reader()
+    r.submit(frame(), [person()], faces=[])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+    assert r.captured_match is None, r.captured_match
+    print("OK person_capture_with_no_face_is_still_captured")
+
+
+def test_a_face_outside_the_person_box_is_not_theirs():
+    """Two people in frame must not swap identities."""
+    r = person_reader()
+    r.submit(frame(), [person()], faces=[face(x=100, y=450)])
+    assert r.captured_match is None, r.captured_match
+    print("OK a_face_outside_the_person_box_is_not_theirs")
+
+
+def test_a_named_face_beats_an_unnamed_one():
+    r = person_reader()
+    r.submit(frame(), [person()],
+             faces=[face(x=610, y=450, name=None, sim=0.99), face(x=660, y=450)])
+    assert r.captured_match == ("BUDI", 0.88), r.captured_match
+    print("OK a_named_face_beats_an_unnamed_one")
+
+
+def test_faces_are_scaled_into_the_full_frame():
+    """Faces arrive in detection-frame coords; boxes are in full-frame coords."""
+    r = person_reader()
+    # scale 2.0: the detection frame is half the size of the frame handed in.
+    # Detection frame is 1280x720, the real frame 2560x1440; the person stands
+    # in the lower half of both, which is where the zone is.
+    r.submit(np.zeros((1440, 2560, 3), dtype=np.uint8),
+             [Detection(3, "person", 0.9, 300, 400, 350, 560)],
+             scale=2.0, faces=[face(x=315, y=405, w=15, h=15)])
+    assert r.captured_match == ("BUDI", 0.88), r.captured_match
+    print("OK faces_are_scaled_into_the_full_frame")
+
+
+def test_person_goes_to_the_sink_not_the_plate_table():
+    """A person is a face sighting; only vehicles become plate rows."""
+    alpr = StubALPR()
+    r = person_reader(alpr=alpr)
+    r._do_capture(1, 3, "person", np.zeros((10, 10, 3), np.uint8), None,
+                  (0, 0, 10, 10), ("BUDI", 0.88))
+    assert r.sunk == [("BUDI", 0.88)], r.sunk
+    print("OK person_goes_to_the_sink_not_the_plate_table")
+
+
+# ------------------------------------------------- the sink and its throttle
+class FakeFaceState:
+    """_FaceState's logging throttle, without the models behind it."""
+
+    def __init__(self, cooldown=20, log_unknown=False):
+        self.cooldown = cooldown
+        self.log_unknown = log_unknown
+        self.last_logged = {}
+        self._log_lock = threading.Lock()
+
+    claim_log = worker._FaceState.claim_log
+
+
+def sink_with(monkey_rows, fstate):
+    """_person_sink, with _persist_sighting captured instead of written."""
+    real = worker._persist_sighting
+    worker._persist_sighting = lambda src, name, sim, crop: monkey_rows.append((name, sim))
+    try:
+        return worker._person_sink(1, fstate), real
+    except Exception:
+        worker._persist_sighting = real
+        raise
+
+
+def test_a_recognized_person_is_not_filed_twice():
+    """The frame-wide face pass logged BUDI; the zone capture must stand down."""
+    rows = []
+    fs = FakeFaceState()
+    sink, real = sink_with(rows, fs)
+    try:
+        assert fs.claim_log("BUDI", time.time())      # the face pass got there first
+        sink("BUDI", 0.88, None, None, None)
+        assert rows == [], rows
+    finally:
+        worker._persist_sighting = real
+    print("OK a_recognized_person_is_not_filed_twice")
+
+
+def test_a_recognized_person_is_filed_when_the_face_pass_missed_them():
+    rows = []
+    fs = FakeFaceState()
+    sink, real = sink_with(rows, fs)
+    try:
+        sink("BUDI", 0.88, None, None, None)
+        assert rows == [("BUDI", 0.88)], rows
+    finally:
+        worker._persist_sighting = real
+    print("OK a_recognized_person_is_filed_when_the_face_pass_missed_them")
+
+
+def test_an_unrecognized_person_is_always_filed():
+    """The capability the frame-wide pass cannot provide: a face it never saw."""
+    rows = []
+    fs = FakeFaceState(log_unknown=False)
+    sink, real = sink_with(rows, fs)
+    try:
+        sink(None, 0.0, None, None, None)
+        sink(None, 0.0, None, None, None)   # a second, different person
+        assert rows == [(None, 0.0), (None, 0.0)], rows
+    finally:
+        worker._persist_sighting = real
+    print("OK an_unrecognized_person_is_always_filed")
+
+
+def test_unknowns_respect_the_throttle_when_the_face_pass_logs_them_too():
+    """With FACE_LOG_UNKNOWN on there *is* something to collide with."""
+    rows = []
+    fs = FakeFaceState(log_unknown=True)
+    sink, real = sink_with(rows, fs)
+    try:
+        sink(None, 0.0, None, None, None)
+        sink(None, 0.0, None, None, None)
+        assert rows == [(None, 0.0)], rows
+    finally:
+        worker._persist_sighting = real
+    print("OK unknowns_respect_the_throttle_when_the_face_pass_logs_them_too")
+
+
+def test_person_capture_works_with_face_recognition_off():
+    """No recognizer on this source: still record that someone came through."""
+    rows = []
+    sink, real = sink_with(rows, None)
+    try:
+        sink(None, 0.0, None, None, None)
+        assert rows == [(None, 0.0)], rows
+    finally:
+        worker._persist_sighting = real
+    print("OK person_capture_works_with_face_recognition_off")
 
 
 def test_capture_classes_parsing():

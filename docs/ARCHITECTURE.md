@@ -161,7 +161,7 @@ Dua tahap: **lokalisasi** lalu **OCR**, dengan dua lapis validasi setelahnya.
 
 ```mermaid
 flowchart TB
-    IN["Box kendaraan hasil tracking<br/>class ∈ ALPR_CLASSES (car, truck, bus)<br/>+ ALPR_CAPTURE_CLASSES (motorcycle) di zona"]
+    IN["Box hasil tracking<br/>class ∈ ALPR_CLASSES (car, truck, bus)<br/>+ ALPR_CAPTURE_CLASSES (motorcycle, person) di zona<br/>person → face_sightings, sisanya → plate_reads"]
     W{"Lebar box cukup<br/>dan ≥ALPR_ZONE_MIN_OVERLAP bagian kotak<br/>berada di dalam zona ALPR?"}
     ATT{"Percobaan track ini < ALPR_MAX_ATTEMPTS?<br/>tiap ALPR_ATTEMPT_INTERVAL frame"}
     CROP["Crop kendaraan dari frame penuh"]
