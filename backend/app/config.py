@@ -165,6 +165,36 @@ class Settings(BaseSettings):
     # and trucks that can be read. Add "motorcycle" back if your camera is
     # close enough to make their plates legible.
     alpr_classes: str = "car,truck,bus"
+    # Classes recorded on sight *inside the ANPR zone*, whether or not a plate
+    # can be read from them. Empty (the default) keeps the old behaviour, where
+    # nothing is written unless OCR produced text.
+    #
+    # This exists for motorcycles. They are excluded from alpr_classes above
+    # because their plates are usually unreadable on an overview camera -- but
+    # "we could not read its plate" is not the same as "it was not there", and
+    # on a gate or alley camera the passage itself is the thing worth keeping.
+    # A capture writes the vehicle crop and the full frame and leaves
+    # plate_text empty; if a plate is read afterwards the same row is filled in
+    # rather than a second one appended.
+    #
+    # Strictly zone-only, by request and by design: with no alpr_zone drawn on
+    # a source, capture is off for that source rather than applied to the whole
+    # frame. Nothing here can take OCR budget away from alpr_classes -- a
+    # capture never evicts a queued plate read, and the opportunistic read that
+    # follows one runs only when no read is waiting.
+    #
+    # A class listed in alpr_classes as well is read, not captured: it already
+    # has the full attempt budget, and capturing it too would write a row for
+    # every vehicle that entered the zone.
+    alpr_capture_classes: str = ""
+    # Minimum width, in full-resolution pixels, of a box before it is captured.
+    #
+    # Deliberately separate from alpr_min_vehicle_width: that floor is about
+    # whether a *plate* can be resolved, and at 160 px it rejects almost every
+    # motorcycle on an overview camera -- which would leave this feature
+    # capturing nothing. A capture only has to show the vehicle, so the floor
+    # is much lower. 0 disables it.
+    alpr_capture_min_width: int = 48
     # Minimum width, in full-resolution pixels, of a vehicle box before a plate
     # read is attempted on it.
     #

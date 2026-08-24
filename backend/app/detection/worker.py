@@ -567,6 +567,8 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             attempt_interval=settings.alpr_attempt_interval,
             classes=_alpr_classes(settings.alpr_classes),
             min_vehicle_width=settings.alpr_min_vehicle_width,
+            capture_classes=_capture_classes(settings.alpr_capture_classes),
+            capture_min_width=settings.alpr_capture_min_width,
             zone=source_cfg.get("alpr_zone"),
             save_frame=settings.alpr_save_frame,
             stationary_seconds=settings.alpr_stationary_seconds,
@@ -742,6 +744,11 @@ _PLATE_QUEUE_SIZE = 8
 # have no usable read yet. Below this we keep trying and keep the best.
 _PLATE_GOOD_ENOUGH_CONF = 0.75
 
+# Filename stand-in for a capture that has no plate text yet. Only the file is
+# named this; the row keeps plate_text empty, which is what the UI reads.
+_CAPTURE_LABEL = "NOPLATE"
+
+
 # How much of a vehicle's own size it has to shift before it counts as having
 # moved. Detection boxes jitter by a few percent from frame to frame even on a
 # stationary car; 15% of the box is well clear of that and still far less than
@@ -768,6 +775,23 @@ def _alpr_classes(configured: str) -> tuple[str, ...]:
         print(f"[ALPR] ignoring unknown ALPR_CLASSES entries: {', '.join(unknown)}")
     classes = tuple(n for n in wanted if n in VEHICLE_CLASSES)
     return classes or VEHICLE_CLASSES
+
+
+def _capture_classes(configured: str) -> tuple[str, ...]:
+    """Parse ALPR_CAPTURE_CLASSES into the classes recorded on sight in zone.
+
+    Unlike :func:`_alpr_classes` an empty setting means *none*, not "all": this
+    is an opt-in addition, and defaulting it to every class would start writing
+    a row for every vehicle that crosses the zone.
+    """
+    wanted = [s.strip().lower() for s in configured.split(",") if s.strip()]
+    unknown = [n for n in wanted if n not in VEHICLE_CLASSES]
+    if unknown:
+        print(
+            "[ALPR] ignoring unknown ALPR_CAPTURE_CLASSES entries: "
+            f"{', '.join(unknown)}"
+        )
+    return tuple(n for n in wanted if n in VEHICLE_CLASSES)
 
 
 class _PlateReader:
@@ -806,6 +830,8 @@ class _PlateReader:
         attempt_interval: int = 3,
         classes: tuple[str, ...] = VEHICLE_CLASSES,
         min_vehicle_width: int = 0,
+        capture_classes: tuple[str, ...] = (),
+        capture_min_width: int = 0,
         zone: dict | None = None,
         save_frame: bool = False,
         stationary_seconds: float = 20.0,
@@ -819,6 +845,17 @@ class _PlateReader:
         self._classes = classes
         self._min_vehicle_width = max(0, min_vehicle_width)
         self._zone = zone or None
+        # Capture is zone-only: with no zone drawn there is nothing to be
+        # "inside", and applying it to the whole frame would record every
+        # passing motorcycle instead of the ones at the gate.
+        self._capture_classes = tuple(capture_classes)
+        if self._capture_classes and self._zone is None:
+            print(
+                "[ALPR] ALPR_CAPTURE_CLASSES is set but this source has no ANPR "
+                "zone; capture stays off until one is drawn."
+            )
+            self._capture_classes = ()
+        self._capture_min_width = max(0, capture_min_width)
         self._save_frame = save_frame
         # Last exception type reported, so a persistent fault is logged once
         # rather than once per vehicle per frame.
@@ -851,7 +888,9 @@ class _PlateReader:
         """
         now = time.monotonic()
         for det in detections:
-            if det.class_name not in self._classes:
+            readable = det.class_name in self._classes
+            capturable = det.class_name in self._capture_classes
+            if not readable and not capturable:
                 continue
 
             box = det.scaled(scale)
@@ -864,6 +903,9 @@ class _PlateReader:
             vehicle = self._vehicles.observe(det.track_id, (x1, y1, x2, y2), now)
 
             if vehicle.vid in self._pending:
+                continue
+            if capturable and not readable:
+                self._maybe_capture(vehicle, det, frame, (x1, y1, x2, y2), now)
                 continue
             if vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
                 continue  # already read well; spend the budget elsewhere
@@ -905,7 +947,7 @@ class _PlateReader:
                 crop = frame[y1:y2, x1:x2].copy()
             self._offer(
                 vehicle.vid,
-                (vehicle.vid, det.track_id, det.class_name, crop, snapshot,
+                ("read", vehicle.vid, det.track_id, det.class_name, crop, snapshot,
                  (x1, y1, x2, y2)),
             )
 
@@ -913,6 +955,53 @@ class _PlateReader:
         # renumbered car keeps the plate already read from it on screen.
         self.plates = self._vehicles.labels()
         self._vehicles.prune(now)
+
+    def _maybe_capture(self, vehicle, det, frame, box, now: float) -> None:
+        """Record a capture-class vehicle the first time it is seen in zone.
+
+        Runs the same gauntlet as a plate read -- zone, size, parked -- and for
+        the same reasons, but answers a different question: not "can we read
+        this plate" but "did this vehicle pass through here". So it fires once
+        per *vehicle* rather than once per attempt, and the row it writes is
+        complete on its own with plate_text left empty.
+
+        Deliberately cheap and non-competitive. It queues no OCR of its own;
+        the read, if any, is attempted by the worker thread only when nothing
+        else is waiting (see :meth:`_run`), so a busy junction still spends its
+        whole OCR budget on the classes in ALPR_CLASSES.
+        """
+        x1, y1, x2, y2 = box
+        if vehicle.captured:
+            return  # already recorded; survives the tracker renumbering it
+        if x2 - x1 < self._capture_min_width:
+            return
+        if not self._in_zone(frame, x1, x2, y2):
+            return
+        if self._vehicles.is_parked(vehicle, now):
+            # Parked in the zone. It was captured when it arrived, or it was
+            # already standing there when the worker started -- either way,
+            # recording it now would log a vehicle that is not passing through.
+            return
+        if frame[y1:y2, x1:x2].size == 0:
+            return
+        if self._save_frame:
+            snapshot = frame.copy()
+            crop = snapshot[y1:y2, x1:x2]  # a view into our own copy
+        else:
+            snapshot = None
+            crop = frame[y1:y2, x1:x2].copy()
+        # Marked only once the job is actually queued. A capture yields to
+        # plate reads, so a busy queue drops it -- and marking first would turn
+        # "we were busy for one frame" into "this motorcycle was never here".
+        # Retrying costs a failed put_nowait per frame, and the moment one gets
+        # through the flag stops it.
+        if self._offer(
+            vehicle.vid,
+            ("capture", vehicle.vid, det.track_id, det.class_name, crop, snapshot,
+             (x1, y1, x2, y2)),
+            evict=False,
+        ):
+            vehicle.captured = True
 
     def _in_zone(self, frame, x1: int, x2: int, y2: int) -> bool:
         """Is the vehicle's ground contact point inside the read zone?"""
@@ -924,7 +1013,8 @@ class _PlateReader:
         zx1, zy1, zx2, zy2 = zone
         return zx1 <= (x1 + x2) / 2.0 <= zx2 and zy1 <= y2 <= zy2
 
-    def _offer(self, vid: int, job: tuple) -> None:
+    def _offer(self, vid: int, job: tuple, evict: bool = True) -> bool:
+        """Queue a job; True if it was taken, False if it yielded and was dropped."""
         # Marked pending before the put, not after: the thread can finish the
         # job -- and clear the mark -- before this call returns, and setting it
         # afterwards would leave the vehicle pending for good.
@@ -932,10 +1022,17 @@ class _PlateReader:
         while True:
             try:
                 self._queue.put_nowait(job)
-                return
+                return True
             except queue.Full:
+                if not evict:
+                    # A capture waits its turn rather than taking a plate read's
+                    # place. This is the whole guarantee that the feature costs
+                    # ALPR_CLASSES nothing: when the queue is full it is full of
+                    # work that can actually produce a plate.
+                    self._pending.discard(vid)
+                    return False
                 try:
-                    stale = self._queue.get_nowait()[0]
+                    stale = self._queue.get_nowait()[1]
                     if stale != vid:
                         self._pending.discard(stale)
                 except queue.Empty:
@@ -946,8 +1043,11 @@ class _PlateReader:
             job = self._queue.get()
             if job is None:  # shutdown
                 return
-            vid, tid, class_name, crop, snapshot, box = job
+            kind, vid, tid, class_name, crop, snapshot, box = job
             try:
+                if kind == "capture":
+                    self._do_capture(vid, tid, class_name, crop, snapshot, box)
+                    continue
                 result = self._alpr.read_plate(crop)
                 vehicle = self._vehicles.get(vid)
                 if result is not None and vehicle is not None:
@@ -976,6 +1076,47 @@ class _PlateReader:
                     print(f"[ALPR] plate read failed: {type(exc).__name__}: {exc}")
             finally:
                 self._pending.discard(vid)
+
+    def _do_capture(self, vid, tid, class_name, crop, snapshot, box) -> None:
+        """Write the capture row, then try for a plate only if nothing is waiting.
+
+        The row goes in first and unconditionally: the capture is the point, and
+        an OCR failure must not cost us the record of the passage. If the read
+        does land it corrects that same row through ``row_id``, which is the
+        mechanism the plate path already uses to replace a poor read with a
+        better one -- so a motorcycle produces one row either way.
+        """
+        # Detached before the write, because _persist_plate draws the evidence
+        # box onto the snapshot and this crop is a view into it -- a 2 px line
+        # straight across the edge of what OCR is about to be shown.
+        ocr_crop = crop if snapshot is None else crop.copy()
+        vehicle = self._vehicles.get(vid)
+        row_id = _persist_plate(
+            self._source_id, tid, class_name, "", 0.0, crop,
+            snapshot=snapshot, box=box,
+            row_id=vehicle.row_id if vehicle is not None else None,
+        )
+        if vehicle is not None and row_id is not None:
+            vehicle.row_id = row_id
+
+        # Best effort, and only with the queue idle -- a waiting job is a plate
+        # read from ALPR_CLASSES, and this must never be what delays it.
+        if vehicle is None or row_id is None or not self._queue.empty():
+            return
+        result = self._alpr.read_plate(ocr_crop)
+        if result is None:
+            return
+        text, conf, plate_img = result
+        if conf <= vehicle.best_conf:
+            return
+        vehicle.best_conf = conf
+        vehicle.text = text
+        updated = _persist_plate(
+            self._source_id, tid, class_name, text, conf, plate_img,
+            snapshot=None, box=box, row_id=row_id,
+        )
+        if updated is not None:
+            vehicle.row_id = updated
 
     def close(self) -> None:
         # Drop the backlog first, so the sentinel always fits.
@@ -1024,6 +1165,7 @@ def _write_evidence_frame(
     if box is not None:
         x1, y1, x2, y2 = box
         cv2.rectangle(snapshot, (x1, y1), (x2, y2), _EVIDENCE_COLOR, 2)
+        text = text or _CAPTURE_LABEL
         cv2.putText(
             snapshot, text, (x1, max(14, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA,
@@ -1082,7 +1224,15 @@ def _persist_plate(
     The timestamp is not refreshed on a correction: it records when the vehicle
     passed, and reading its plate better does not move that moment.
     """
-    fname = f"{source_id}_{track_id}_{_now():%Y%m%d_%H%M%S}_{text}.jpg"
+    stamp = _now()
+    # A read is named after the plate, which is what makes it findable on disk.
+    # A capture has no plate, and naming every one of them the same thing would
+    # have two captures a second apart on one camera resolve to the same file --
+    # where the second write silently replaces the first, and superseding it
+    # later deletes an image the earlier row still points at. Microseconds are
+    # what keeps them distinct.
+    label = text or f"{_CAPTURE_LABEL}{stamp:%f}"
+    fname = f"{source_id}_{track_id}_{stamp:%Y%m%d_%H%M%S}_{label}.jpg"
     # The crop first: _write_evidence_frame draws on the snapshot, and the crop
     # can be a view into it.
     image_path = _write_image(settings.plates_dir, fname, plate_img)
@@ -1096,9 +1246,11 @@ def _persist_plate(
     db = SessionLocal()
     try:
         row = db.get(PlateRead, row_id) if row_id is not None else None
-        if row is None:
+        if row is None and text:
             # No row of our own yet: with ALPR_DUPLICATE_WINDOW_SECONDS set,
             # one already recorded for this plate on this camera counts as ours.
+            # Skipped for a capture: its text is empty, and every unread capture
+            # on the camera would match every other one.
             row = _recent_duplicate(db, source_id, text)
             if row is not None and row.confidence >= conf:
                 # ...and it is the better read of the two, so it stands as it is

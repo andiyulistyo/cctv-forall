@@ -527,6 +527,8 @@ per worker.
   diunduh otomatis oleh setup script). Tanpa ini `alpr.py` memakai heuristik
   "ambil 45% bawah box kendaraan", yang merupakan sumber salah-baca terbesar.
   Di GPU biayanya nyaris nol.
+- **Motor direkam walau platnya tidak terbaca** — `ALPR_CAPTURE_CLASSES=motorcycle`,
+  lihat bagian di bawah.
 - **Percobaan ANPR lebih longgar** — `ALPR_MAX_ATTEMPTS=24`,
   `ALPR_ATTEMPT_INTERVAL=2` (profil CPU: 12 dan 3). Lebih banyak percobaan per
   kendaraan berarti lebih besar peluang menangkap satu frame di mana platnya
@@ -537,6 +539,49 @@ per worker.
   anotasi dan encode JPEG di sana. `WORKER_CPU_AFFINITY=off` karena pinning ada
   khusus untuk mengikat TBB milik OpenVINO — worker CUDA tidak punya pool itu,
   jadi mengurungnya ke irisan core hanya memperlambat.
+
+### Merekam motor yang lewat zona ANPR
+
+`ALPR_CLASSES` sengaja tidak memuat `motorcycle`: plat motor Indonesia kira-kira
+separuh lebar plat mobil, dipasang rendah dan sering miring, jadi pada kamera
+overview OCR-nya nyaris selalu gagal sementara jatah percobaannya tetap
+terpakai. Konsekuensinya, motor tidak meninggalkan jejak apa pun — "platnya
+tidak terbaca" tercatat sama dengan "tidak ada yang lewat".
+
+`ALPR_CAPTURE_CLASSES` memisahkan dua hal itu:
+
+```dotenv
+ALPR_CAPTURE_CLASSES=motorcycle
+ALPR_CAPTURE_MIN_WIDTH=48
+```
+
+Setiap motor yang masuk zona ANPR ditulis satu baris di tabel yang sama dengan
+plat: potongan gambar motornya, frame penuh dengan kotak kendaraannya, dan
+`plate_text` dibiarkan kosong (tampil sebagai *belum terbaca* di halaman Plat).
+Kalau platnya kemudian berhasil dibaca, **baris yang sama** diisi — bukan
+ditambah baris baru.
+
+Tiga batasan yang membuatnya aman dipasang di atas setup yang sudah jalan:
+
+- **Hanya di dalam zona.** Source yang belum digambar zona ANPR-nya tidak
+  merekam apa pun. Zona kosong berarti fitur mati untuk source itu, bukan
+  "seluruh frame jadi zona".
+- **Tidak mengambil jatah OCR `ALPR_CLASSES`.** Sebuah capture tidak pernah
+  menggeser plate read yang sedang mengantre; kalau antreannya penuh, capture-
+  lah yang dibuang. Pembacaan plat opsional yang menyusul sebuah capture baru
+  dijalankan kalau antreannya benar-benar kosong.
+- **Sekali per kendaraan, bukan sekali per frame.** Memakai `VehicleRegistry`
+  yang sama dengan ANPR, jadi motor yang berhenti di zona dan terus diganti
+  nomor track-nya tetap satu baris — masalah yang sama yang dulu membuat satu
+  mobil parkir memenuhi daftar plat.
+
+`ALPR_CAPTURE_MIN_WIDTH` sengaja terpisah dari `ALPR_MIN_VEHICLE_WIDTH`: angka
+160 px itu soal apakah *plat*-nya bisa terbaca dan akan menolak hampir semua
+motor. Capture cuma perlu memperlihatkan kendaraannya.
+
+Kelas yang sudah ada di `ALPR_CLASSES` tidak ikut di-capture: kelas itu sudah
+punya jatah percobaan penuh, dan merekamnya juga berarti satu baris untuk
+setiap kendaraan yang masuk zona.
 
 ### Kenapa `FFMPEG_HWACCEL` tetap `auto`, bukan `cuda`
 
@@ -775,6 +820,8 @@ memang bisa berhasil.
 | `ALPR_ATTEMPT_INTERVAL` | 3 | jalankan OCR tiap N percobaan (1 = tiap frame deteksi) |
 | `ALPR_CLASSES` | `car,truck,bus` | kelas yang platnya dibaca; motor sengaja tidak termasuk |
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
+| `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, platnya terbaca atau tidak; isi `motorcycle` untuk motor |
+| `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
 | `ALPR_SAVE_FRAME` | true | simpan 1 frame penuh (kendaraan dikotaki) per plat terbaca |
 | `ALPR_STATIONARY_SECONDS` | 20 | kendaraan yang diam selama ini dianggap berhenti/parkir dan berhenti dibaca (0 = matikan) |
 | `ALPR_REID_GAP_SECONDS` | 4 | selisih waktu maksimum sebelum box di tempat yang sama dianggap kendaraan **lain** (0 = matikan re-id) |

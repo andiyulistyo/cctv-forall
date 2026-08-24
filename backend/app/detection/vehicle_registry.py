@@ -83,6 +83,11 @@ class Vehicle:
     best_conf: float = 0.0
     text: str = ""
     row_id: int | None = None
+    # Already recorded once by the capture path (see ALPR_CAPTURE_CLASSES).
+    # Carried across renumbering for the same reason the plate state is: a
+    # motorcycle that stops in the zone is renumbered every few seconds, and a
+    # per-track flag would record it again on each new id.
+    captured: bool = False
 
 
 class VehicleRegistry:

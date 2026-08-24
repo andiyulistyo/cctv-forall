@@ -335,7 +335,18 @@ export default function Plates() {
                   )}
                 </td>
                 <td className="p-3 font-mono text-base font-semibold tracking-wider">
-                  <Highlight text={p.plate_text} needle={needle} />
+                  {p.plate_text ? (
+                    <Highlight text={p.plate_text} needle={needle} />
+                  ) : (
+                    // A capture (ALPR_CAPTURE_CLASSES): the vehicle passed
+                    // through the zone but its plate was never read.
+                    <span
+                      className="font-sans text-xs font-normal text-slate-500"
+                      title="Terekam di zona ANPR, plat belum terbaca"
+                    >
+                      belum terbaca
+                    </span>
+                  )}
                 </td>
                 <td className="p-3">
                   <ClassBadge name={p.vehicle_class} />
