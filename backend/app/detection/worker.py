@@ -1446,7 +1446,8 @@ def _persist_plate(
                 # pair. (db.close() still runs; only the discard loop at the end
                 # is skipped, and it is done here instead.)
                 for path in (image_path, frame_path):
-                    _discard_plate_image(path)
+                    if path not in (row.image_path, row.frame_path):
+                        _discard_plate_image(path)
                 return row.id
         if row is None:
             row = PlateRead(
@@ -1464,10 +1465,17 @@ def _persist_plate(
             row.vehicle_class = vehicle_class
             row.plate_text = text
             row.confidence = conf
-            if image_path:
+            # Only a path we are actually replacing is superseded. A read is
+            # named after the plate and stamped to the second, so two reads of
+            # one vehicle inside that second resolve to the same filename: the
+            # write lands on top of the file already there, and the row is left
+            # pointing at exactly what it pointed at before. Superseding that
+            # would delete the live image out from under the row -- the read
+            # survives in the listing with nothing behind it to show.
+            if image_path and image_path != row.image_path:
                 superseded.append(row.image_path)
                 row.image_path = image_path
-            if frame_path:
+            if frame_path and frame_path != row.frame_path:
                 superseded.append(row.frame_path)
                 row.frame_path = frame_path
         db.commit()
