@@ -496,10 +496,20 @@ class FakeFaceState:
     claim_log = worker._FaceState.claim_log
 
 
-def sink_with(monkey_rows, fstate):
-    """_person_sink, with _persist_sighting captured instead of written."""
+def sink_with(monkey_rows, fstate, evidence=None):
+    """_person_sink, with _persist_sighting captured instead of written.
+
+    ``evidence`` collects the full-frame arguments, which most of these tests
+    do not care about but one of them is entirely about.
+    """
     real = worker._persist_sighting
-    worker._persist_sighting = lambda src, name, sim, crop: monkey_rows.append((name, sim))
+
+    def capture(src, name, sim, crop, snapshot=None, box=None):
+        monkey_rows.append((name, sim))
+        if evidence is not None:
+            evidence.append((snapshot, box))
+
+    worker._persist_sighting = capture
     try:
         return worker._person_sink(1, fstate), real
     except Exception:
@@ -531,6 +541,26 @@ def test_a_recognized_person_is_filed_when_the_face_pass_missed_them():
     finally:
         worker._persist_sighting = real
     print("OK a_recognized_person_is_filed_when_the_face_pass_missed_them")
+
+
+def test_a_person_capture_carries_its_evidence_frame():
+    """The snapshot the capture already copied reaches the sighting row.
+
+    A face crop says who was seen. Only the frame says where they were and who
+    was with them, which is the whole reason the Wajah page can show one -- and
+    the capture path is the one that already holds a snapshot, so nothing extra
+    is copied to get it there.
+    """
+    rows, evidence = [], []
+    fs = FakeFaceState()
+    sink, real = sink_with(rows, fs, evidence)
+    try:
+        snapshot = np.zeros((48, 64, 3), dtype=np.uint8)
+        sink("BUDI", 0.88, None, snapshot, (4, 6, 20, 30))
+        assert evidence == [(snapshot, (4, 6, 20, 30))], evidence
+    finally:
+        worker._persist_sighting = real
+    print("OK a_person_capture_carries_its_evidence_frame")
 
 
 def test_an_unrecognized_person_is_always_filed():

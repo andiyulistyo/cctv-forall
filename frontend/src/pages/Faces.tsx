@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { api, EnrolledFace, Sighting, Source } from "../api";
+import { SightingEvidenceModal } from "../components/common";
 
 export default function Faces() {
   const [faces, setFaces] = useState<EnrolledFace[]>([]);
   const [sightings, setSightings] = useState<Sighting[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [sourceId, setSourceId] = useState<number | undefined>(undefined);
+  const [evidence, setEvidence] = useState<Sighting | null>(null);
 
   const [name, setName] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -14,7 +16,14 @@ export default function Faces() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const loadFaces = async () => setFaces(await api.listFaces());
-  const loadSightings = async () => setSightings(await api.listSightings(sourceId, 200));
+  const loadSightings = async () => {
+    const rows = await api.listSightings(sourceId, 200);
+    setSightings(rows);
+    // The list is refetched every five seconds. Without this the open modal
+    // would keep pointing at the object from the fetch it was opened on --
+    // harmless today, wrong the moment a sighting is ever corrected in place.
+    setEvidence((cur) => (cur ? rows.find((r) => r.id === cur.id) ?? cur : null));
+  };
 
   useEffect(() => {
     loadFaces();
@@ -55,6 +64,12 @@ export default function Faces() {
 
   return (
     <div>
+      <SightingEvidenceModal
+        sighting={evidence}
+        sourceName={evidence ? nameOf(evidence.source_id) : undefined}
+        onClose={() => setEvidence(null)}
+      />
+
       <h1 className="mb-5 text-2xl font-semibold">Pengenalan Wajah</h1>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -147,7 +162,19 @@ export default function Faces() {
               </thead>
               <tbody>
                 {sightings.map((s) => (
-                  <tr key={s.id} className="border-t border-slate-800">
+                  <tr
+                    key={s.id}
+                    onClick={() => setEvidence(s)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setEvidence(s);
+                      }
+                    }}
+                    tabIndex={0}
+                    title="Lihat hasil capture"
+                    className="cursor-pointer border-t border-slate-800 hover:bg-slate-900/50 focus:bg-slate-900/50 focus:outline-none"
+                  >
                     <td className="p-3">
                       {s.has_image ? (
                         <img

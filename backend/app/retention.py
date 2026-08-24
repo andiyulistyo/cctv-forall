@@ -47,10 +47,12 @@ def purge_old_data() -> dict:
             select(FaceSighting).where(FaceSighting.timestamp < cutoff)
         ).all()
         for fs in old_sightings:
-            if fs.image_path:
-                fpath = settings.data_dir / fs.image_path
+            # Both the face crop and the full-frame evidence image.
+            for rel in (fs.image_path, fs.frame_path):
+                if not rel:
+                    continue
                 try:
-                    fpath.unlink(missing_ok=True)
+                    (settings.data_dir / rel).unlink(missing_ok=True)
                 except Exception:
                     pass
         removed_sightings = db.execute(

@@ -155,6 +155,7 @@ def list_sightings(
             name=s.name,
             similarity=s.similarity,
             has_image=bool(s.image_path),
+            has_frame=bool(s.frame_path),
             timestamp=s.timestamp,
         )
         for s in rows
@@ -170,4 +171,17 @@ def sighting_image(sighting_id: int, token: str = Query(...), db: Session = Depe
     fpath = settings.data_dir / s.image_path
     if not fpath.exists():
         raise HTTPException(404, "Image file missing")
+    return FileResponse(str(fpath), media_type="image/jpeg")
+
+
+@router.get("/sightings/{sighting_id}/frame")
+def sighting_frame(sighting_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    """The full frame behind one sighting, with the face boxed."""
+    validate_token(token)
+    s = db.get(FaceSighting, sighting_id)
+    if not s or not s.frame_path:
+        raise HTTPException(404, "No frame")
+    fpath = settings.data_dir / s.frame_path
+    if not fpath.exists():
+        raise HTTPException(404, "Frame file missing")
     return FileResponse(str(fpath), media_type="image/jpeg")

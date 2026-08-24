@@ -177,6 +177,7 @@ class FaceSightingOut(BaseModel):
     name: str | None
     similarity: float
     has_image: bool
+    has_frame: bool = False
     timestamp: datetime
 
     model_config = {"from_attributes": True}

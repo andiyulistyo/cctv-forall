@@ -248,6 +248,9 @@ andal.
   `ALPR_SAVE_FRAME=true`. Perkiraan kasar: 500 pembacaan/hari/stream × 1,9 MB ≈
   **±950 MB/hari/stream**, jadi dengan `RETENTION_DAYS=7` ≈ **±6,6 GB per
   stream**. Kalau disk terbatas: matikan `ALPR_SAVE_FRAME` atau turunkan retensi.
+- **Kemunculan wajah menyimpan frame penuh juga** (`FACE_SAVE_FRAME=true`), tapi
+  jauh lebih jarang: `FACE_SIGHTING_COOLDOWN_SEC` membatasi satu catatan per
+  identitas per 20 detik, jadi porsinya kecil dibanding ANPR.
 - **SSD wajib** — SQLite berjalan mode WAL.
 - **Jaringan:** RTSP dipaksa lewat TCP (`RTSP_TRANSPORT_TCP=true`) karena UDP
   menghasilkan jauh lebih banyak frame rusak dari CCTV.
@@ -977,6 +980,7 @@ memang bisa berhasil.
 | `FACE_SIMILARITY_THRESHOLD` | 0.363 | ambang cosine SFace (lebih tinggi = lebih ketat) |
 | `FACE_BACKEND` | `auto` | `onnx` (GPU, cepat) / `opencv` / `auto`; ganti = wajib daftar ulang wajah |
 | `FACE_MAX_SIDE` | 1024 | frame diperkecil ke sisi terpanjang ini sebelum deteksi wajah |
+| `FACE_SAVE_FRAME` | true | simpan 1 frame penuh (wajah dikotaki) per kemunculan yang tercatat — inilah yang tampil saat baris di halaman Wajah diklik |
 | `RETENTION_DAYS` | 7 | umur data sebelum dihapus |
 
 ## Testing logika line counting

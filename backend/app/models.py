@@ -159,6 +159,10 @@ class FaceSighting(Base):
     name: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     similarity: Mapped[float] = mapped_column(Float, default=0.0)
     image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Full frame at the moment of the sighting, with the face boxed -- the same
+    # role PlateRead.frame_path plays for a read. A face crop says who; only the
+    # frame says where they were and what else was in shot.
+    frame_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     source: Mapped[Source] = relationship(back_populates="face_sightings")

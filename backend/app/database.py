@@ -53,6 +53,7 @@ def get_db():
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("sources", "alpr_zone", "JSON"),
     ("plate_reads", "frame_path", "TEXT"),
+    ("face_sightings", "frame_path", "TEXT"),
 )
 
 

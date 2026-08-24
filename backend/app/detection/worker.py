@@ -553,6 +553,7 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
                 threshold=settings.face_similarity_threshold,
                 cooldown=settings.face_sighting_cooldown_sec,
                 log_unknown=settings.face_log_unknown,
+                save_frame=settings.face_save_frame,
             )
             fstate.reload_gallery()
 
@@ -1483,17 +1484,28 @@ def _persist_plate(
 
 # ----------------------- Face recognition -----------------------
 _GALLERY_RELOAD_SEC = 30.0
+# What the evidence frame is labelled with when the face matched nobody
+# enrolled. Mirrors _CAPTURE_LABEL on the plate side.
+_UNKNOWN_LABEL = "UNKNOWN"
 
 
 class _FaceState:
     """Holds the recognizer, the enrolled gallery, and per-identity logging
     cooldowns for one running source."""
 
-    def __init__(self, recognizer: FaceRecognizer, threshold: float, cooldown: int, log_unknown: bool):
+    def __init__(
+        self,
+        recognizer: FaceRecognizer,
+        threshold: float,
+        cooldown: int,
+        log_unknown: bool,
+        save_frame: bool = False,
+    ):
         self.rec = recognizer
         self.threshold = threshold
         self.cooldown = cooldown
         self.log_unknown = log_unknown
+        self.save_frame = save_frame
         self.gallery: np.ndarray | None = None
         self.names: list[str] = []
         self.last_reload = 0.0
@@ -1554,8 +1566,24 @@ def _run_faces(fstate: "_FaceState", frame, source_id: int) -> list:
             continue
         key = name or "__unknown__"
         if fstate.claim_log(key, time.time()):
-            crop = frame[max(0, y): y + h, max(0, x): x + w]
-            _persist_sighting(source_id, name, sim, crop)
+            x1, y1 = max(0, x), max(0, y)
+            if fstate.save_frame:
+                # Copied because the evidence box is drawn onto it, and `frame`
+                # is still on its way to the live overlay and the next detector
+                # pass. One copy per *logged* sighting -- the cooldown keeps
+                # that rare -- not one per detected face.
+                snapshot = frame.copy()
+                crop = snapshot[y1: y + h, x1: x + w]  # a view into our own copy
+            else:
+                snapshot = None
+                crop = frame[y1: y + h, x1: x + w].copy()
+            # The box the crop was actually taken from: YuNet can report a face
+            # starting off the left or top edge, and the clamp is what the crop
+            # already went through.
+            _persist_sighting(
+                source_id, name, sim, crop,
+                snapshot=snapshot, box=(x1, y1, x + w, y + h),
+            )
     return results
 
 
@@ -1583,23 +1611,40 @@ def _person_sink(source_id: int, fstate: "_FaceState | None"):
             name or "__unknown__", time.time()
         ):
             return
-        _persist_sighting(source_id, name, similarity, crop)
+        _persist_sighting(source_id, name, similarity, crop, snapshot=snapshot, box=box)
 
     return sink
 
 
-def _persist_sighting(source_id: int, name: str | None, similarity: float, crop: np.ndarray) -> None:
+def _persist_sighting(
+    source_id: int,
+    name: str | None,
+    similarity: float,
+    crop: np.ndarray,
+    snapshot: np.ndarray | None = None,
+    box: tuple[int, int, int, int] | None = None,
+) -> None:
     image_path = None
+    fname = None
     try:
         ts = _now().strftime("%Y%m%d_%H%M%S_%f")
         label = name or "unknown"
         safe = "".join(c for c in label if c.isalnum() or c in ("-", "_")) or "unknown"
-        fpath = settings.faces_dir / f"sight_{source_id}_{safe}_{ts}.jpg"
+        fname = f"sight_{source_id}_{safe}_{ts}.jpg"
+        fpath = settings.faces_dir / fname
         if crop.size:
             cv2.imwrite(str(fpath), crop)
             image_path = str(fpath.relative_to(settings.data_dir))
     except Exception:
         image_path = None
+
+    # After the crop, never before: the crop can be a view into the snapshot,
+    # and this draws the evidence box onto it.
+    frame_path = (
+        _write_evidence_frame(fname, snapshot, box, name or _UNKNOWN_LABEL)
+        if snapshot is not None and fname is not None
+        else None
+    )
 
     db = SessionLocal()
     try:
@@ -1609,6 +1654,7 @@ def _persist_sighting(source_id: int, name: str | None, similarity: float, crop:
                 name=name,
                 similarity=float(similarity),
                 image_path=image_path,
+                frame_path=frame_path,
                 timestamp=_now(),
             )
         )

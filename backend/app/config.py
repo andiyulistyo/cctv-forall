@@ -359,6 +359,11 @@ class Settings(BaseSettings):
     face_log_unknown: bool = False
     # Don't log the same identity on a source more often than this (seconds).
     face_sighting_cooldown_sec: int = 20
+    # Save the full frame alongside the face crop, with the face boxed -- the
+    # face-side twin of ALPR_SAVE_FRAME. The crop says who was seen; only the
+    # frame says where they were and who they were with. Costs one extra JPEG
+    # per *logged* sighting (the cooldown already keeps those rare).
+    face_save_frame: bool = True
 
     # --- Retention ---
     retention_days: int = 7

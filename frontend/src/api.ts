@@ -133,6 +133,8 @@ export interface Sighting {
   name: string | null;
   similarity: number;
   has_image: boolean;
+  /** A full frame of the moment was kept, with the face boxed. */
+  has_frame: boolean;
   timestamp: string;
 }
 
@@ -244,6 +246,7 @@ export const api = {
   plateFrameUrl: (id: number) => `${BASE}/plates/${id}/frame?token=${getToken() ?? ""}`,
   faceImageUrl: (id: number) => `${BASE}/faces/${id}/image?token=${getToken() ?? ""}`,
   sightingImageUrl: (id: number) => `${BASE}/sightings/${id}/image?token=${getToken() ?? ""}`,
+  sightingFrameUrl: (id: number) => `${BASE}/sightings/${id}/frame?token=${getToken() ?? ""}`,
 
   async snapshotBlobUrl(id: number): Promise<string> {
     const token = getToken();
