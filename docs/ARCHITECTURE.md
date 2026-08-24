@@ -44,7 +44,7 @@ flowchart TB
     subgraph store["Penyimpanan lokal — folder ./data"]
         DB[("SQLite app.db<br/>mode WAL")]
         IMG["data/plates/*.jpg<br/>data/faces/*.jpg"]
-        WGT["data/weights/<br/>yolo11m.pt · plate .pt<br/>yunet.onnx · sface.onnx"]
+        WGT["data/weights/<br/>yolo12m.pt · plate .pt<br/>yunet.onnx · sface.onnx"]
     end
 
     SPA -->|"REST + Bearer JWT"| REST
@@ -101,7 +101,7 @@ flowchart TB
             STRIDE{"frame_no % frame_stride == 0?"}
             SKIP["Lewati inferensi<br/>frame tetap masuk preview"]
             SCALE["Downscale ke process_width<br/>simpan detect_scale"]
-            DET["Detector.track()<br/>Ultralytics YOLO11 + ByteTrack"]
+            DET["Detector.track()<br/>Ultralytics YOLO12 / YOLO11 + ByteTrack"]
             LC["LineCounter<br/>titik kontak roda + pita histeresis"]
             FACE["FaceRecognizer<br/>YuNet deteksi → SFace embedding"]
         end
@@ -478,7 +478,7 @@ flowchart LR
 | Auth | PyJWT (HS256), bcrypt — satu admin |
 | Database | SQLAlchemy 2.0 + SQLite (WAL) |
 | Penjadwalan | APScheduler 3.11 (retensi otomatis) |
-| **Deteksi objek** | **Ultralytics 8.3.200 (YOLO11)** + **ByteTrack** (solver `lap` 0.5.12) |
+| **Deteksi objek** | **Ultralytics 8.3.253** — YOLO12 di profil CUDA, YOLO11 di profil lain + **ByteTrack** (solver `lap` 0.5.12) |
 | **Baca plat** | **YOLO plat khusus** untuk lokalisasi + **EasyOCR 1.7.2** untuk OCR |
 | Wajah | **YuNet** (deteksi) + **SFace** (embedding 128-D), via OpenCV DNN atau ONNX Runtime |
 | Computer vision | OpenCV 4.11 (headless + reguler), NumPy 2.1, Pillow 11 |
@@ -528,6 +528,10 @@ Semua angka: input 1080p, `imgsz=640`, deteksi saja.
 | Ryzen 7 PRO 7840U | `intel:cpu` OpenVINO INT8 | yolo11s | 44 fps |
 | Core i7 gen-7 (2C/4T, HD Graphics) | `intel:gpu` OpenVINO FP16 | yolo11n, imgsz 480 | batas bawah yang masih layak |
 
+Profil CUDA kemudian pindah ke `yolo12m`. Diukur A/B di RTX 5070 Laptop (fp16,
+imgsz 640, input 1080p, 200 frame): yolo11m **94,5 fps** vs yolo12m **69,3 fps**
+— v12 sekitar 27% lebih lambat, ditukar dengan akurasi kelas.
+
 Perhatikan baris Ryzen: **yang menentukan adalah fps saat dipin ke jatah
 core-nya** (55 fps), bukan fps saat memakai seluruh CPU (73 fps) — di produksi
 setiap worker hanya dapat `physical_cores / EXPECTED_STREAMS`.
@@ -541,7 +545,7 @@ flowchart TB
     Q3{"Sudah punya Mac<br/>Apple Silicon?"}
     Q4{"Ada slot GPU diskrit<br/>dan anggarannya?"}
 
-    NV8["NVIDIA 8 GB — RTX 4060 / 5060 / 5070<br/>2-4 stream · yolo11m fp16 · FRAME_STRIDE 1<br/>OCR_DEVICE=cuda · FACE_BACKEND=onnx"]
+    NV8["NVIDIA 8 GB — RTX 4060 / 5060 / 5070<br/>2-4 stream · yolo12m fp16 · FRAME_STRIDE 1<br/>OCR_DEVICE=cuda · FACE_BACKEND=onnx"]
     NV16["NVIDIA 12-16 GB<br/>6-8 stream · CPU minimal 12 core fisik"]
     MAC["Apple M4 / M4 Pro<br/>mps atau CoreML/ANE · yolo11s<br/>FFMPEG_HWACCEL=videotoolbox"]
     ZEN["CPU 8 core Zen 4 / Intel setara<br/>OpenVINO CPU INT8 · yolo11n · FRAME_STRIDE 2"]
@@ -563,7 +567,7 @@ flowchart TB
 | 1–2 stream, anggaran minimum | 4 core fisik | iGPU Intel Gen9+ (`intel:gpu`) atau plugin CPU OpenVINO | 8 GB | `yolo11n` INT8, imgsz 480–640, `FRAME_STRIDE=3` |
 | 4 stream, tanpa GPU diskrit | 8 core fisik Zen 4 / Intel setara (AVX-512, VNNI) | plugin CPU OpenVINO | 16 GB | `yolo11n` INT8, `FRAME_STRIDE=2`, `EXPECTED_STREAMS=4` |
 | 4–10 stream, hemat daya | Apple M4 / M4 Pro | `mps` atau CoreML/ANE | 16–24 GB unified | `yolo11s`, `FRAME_STRIDE=2`, hwaccel VideoToolbox |
-| 2–4 stream + ANPR & wajah | ≥8 core fisik | NVIDIA 8 GB | 16–32 GB | `yolo11m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
+| 2–4 stream + ANPR & wajah | ≥8 core fisik | NVIDIA 8 GB | 16–32 GB | `yolo12m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
 | 6–8 stream + ANPR & wajah *(ekstrapolasi)* | ≥12 core fisik | NVIDIA 12–16 GB | 32 GB | sama, `EXPECTED_STREAMS` disesuaikan |
 
 ### Anggaran VRAM per stream

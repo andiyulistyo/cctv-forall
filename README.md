@@ -6,8 +6,8 @@ lalu lintas (mobil, orang, truk, motor, bus) dari berbagai sumber video, dengan
 
 ## Fitur
 
-- 🎯 **Deteksi objek** (YOLO11): mobil, orang, motor, truk, bus — user memilih
-  kelas mana yang aktif per source.
+- 🎯 **Deteksi objek** (YOLO12 di profil NVIDIA, YOLO11 di profil lain):
+  mobil, orang, motor, truk, bus — user memilih kelas mana yang aktif per source.
 - 📥 **Banyak jenis input**: YouTube, RTSP (CCTV), RTMP, HLS, HTTP/MJPEG, file.
 - 📊 **Dashboard**: tambah source, lihat berapa source aktif, thumbnail live tiap
   source, status real-time.
@@ -97,7 +97,7 @@ Tiga fakta yang sebenarnya menentukan pilihan hardware:
 | **Batas bawah yang sudah diuji** — 1–2 stream | Core i7 gen-7 (2C/4T) *(terukur)* | 8 GB | iGPU Intel Gen9 (`intel:gpu`) | 20 GB SSD | `yolo11n` FP16, imgsz 480 |
 | 4 stream, tanpa GPU diskrit | 8 core fisik Zen 4 / Intel setara | 16 GB | plugin CPU OpenVINO | 128 GB SSD | `yolo11n` INT8, `FRAME_STRIDE=2`, `EXPECTED_STREAMS=4` |
 | 4–10 stream, hemat daya | Apple M4 / M4 Pro *(terukur)* | 16–24 GB unified | `mps` atau CoreML/ANE | 256 GB SSD | `yolo11s`, `FRAME_STRIDE=2`, VideoToolbox |
-| **2–4 stream, full feature nonstop** | ≥8 core fisik | 16–32 GB | NVIDIA ≥8 GB | 256 GB SSD | `yolo11m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
+| **2–4 stream, full feature nonstop** | ≥8 core fisik | 16–32 GB | NVIDIA ≥8 GB | 256 GB SSD | `yolo12m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
 | 6–8 stream, full feature *(ekstrapolasi)* | ≥12 core fisik | 32 GB | NVIDIA 12–16 GB | 512 GB SSD | sama, `EXPECTED_STREAMS` disesuaikan |
 
 Pada baris "minimum absolut", ANPR dan face recognition tetap bisa dinyalakan,
@@ -186,6 +186,9 @@ ditawar lewat konfigurasi.
 
 Terukur di **RTX 5070 Laptop 8 GB**: `yolo11m` fp16 **90,5 fps**, `yolo11s` fp16
 84,1 fps — versus 43,9 fps di OpenVINO CPU INT8 pada mesin yang sama.
+
+Profil NVIDIA sekarang memakai `yolo12m`, yang menukar sebagian throughput itu
+dengan akurasi — lihat [v11 vs v12](#yolo11-vs-yolo12-di-profil-cuda).
 
 > ⚠️ **Kecocokan wheel torch.** RTX seri 50 adalah sm_120 (Blackwell) dan
 > memerlukan wheel CUDA 13; wheel cu128 ke bawah tidak punya kernel untuknya.
@@ -455,14 +458,37 @@ Jadi pindah ke GPU memberi **~2× throughput sekaligus model yang lebih besar**.
 Perhatikan yolo11m tidak lebih lambat dari yolo11s: di imgsz 640 keduanya sudah
 mentok di sisi CPU, bukan di forward pass. Dari ~11 ms per frame, hanya sekitar
 4 ms yang benar-benar inferensi — sisanya letterbox, NMS dan overhead Python
-ultralytics. Itulah alasan profil ini memakai `yolo11m`: akurasinya lebih baik
-dan praktis gratis. Itu juga alasan TensorRT bukan prioritas (lihat bawah).
+ultralytics. Itulah alasan profil ini memakai model ukuran `m`: akurasinya lebih
+baik dan hampir gratis. Itu juga alasan TensorRT bukan prioritas (lihat bawah).
+
+#### YOLO11 vs YOLO12 di profil CUDA
+
+Profil NVIDIA memakai `yolo12m`. Berbeda dari lompatan s→m di atas, v12 **tidak**
+gratis: blok *area-attention*-nya menambah kerja di forward pass, bukan di sisi
+CPU. Diukur A/B pada mesin yang sama, fp16, imgsz 640, input 1080p, 200 frame:
+
+| Model | CUDA fp16 | ms/frame |
+| --- | --- | --- |
+| yolo11m | **94,5 fps** | 10,6 ms |
+| yolo12m | **69,3 fps** | 14,4 ms |
+
+Sekitar **27% lebih lambat**, ditukar dengan akurasi — v12 lebih jarang keliru
+menyebut mobil boxy sebagai `truck`.
+
+Trade ini hanya diambil di profil CUDA. Profil CPU, OpenVINO (Intel/AMD) dan
+macOS tetap di YOLO11: di sana attention jauh lebih mahal, dan dokumentasi
+Ultralytics sendiri menyebut throughput CPU v12 lebih rendah. Default di
+`backend/app/config.py` juga tetap `yolo11n.pt` karena itulah yang dipakai
+instalasi CPU-only dan image Docker.
+
+Mau kembali ke v11? `data/weights/yolo11m.pt` tidak dihapus — cukup kembalikan
+satu baris `YOLO_MODEL` di `.env`.
 
 Ukur di mesin sendiri:
 
 ```powershell
 backend\.venv\Scripts\python scripts\benchmark.py `
-  --model data\weights\yolo11m.pt --imgsz 640
+  --model data\weights\yolo12m.pt --imgsz 640
 ```
 
 ### Pemakaian VRAM (penting di kartu 8 GB)
@@ -575,7 +601,7 @@ landmark atau skornya menyimpang lebih dari 0.5 px (hasil sekarang: 0.03 px).
 
 ```powershell
 backend\.venv\Scripts\python -m pip install -r backend\requirements-cuda.txt
-backend\.venv\Scripts\python scripts\export_tensorrt.py --model data\weights\yolo11m.pt --imgsz 640
+backend\.venv\Scripts\python scripts\export_tensorrt.py --model data\weights\yolo12m.pt --imgsz 640
 ```
 
 Tapi ukur dulu. Hanya ~4 ms dari ~11 ms per frame yang berupa inferensi, jadi

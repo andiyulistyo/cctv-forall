@@ -20,7 +20,14 @@ APScheduler==3.11.0
 # correct CPU vs CUDA wheel. It is intentionally NOT pinned here.
 # >=8.3.150: earlier releases pin numpy<2 on macOS, which cannot resolve on
 # Python 3.12/3.13 (no numpy 1.x wheels) and blocks Apple Silicon installs.
-ultralytics==8.3.200
+# 8.3.253 is the last of the 8.3 series and is where the NVIDIA profile's
+# yolo12m weights come from. 8.4.x is deliberately skipped: it introduces
+# YOLO26 and pulls in nvidia-ml-py + ultralytics-platform, a much larger
+# surface than this app needs. Against 8.3.200 the runtime dependencies are
+# unchanged (only tightened floors on psutil/polars/thop), and bytetrack.yaml
+# and the predict/NMS defaults are byte-identical -- which is what keeps
+# tracking and counting behaviour the same across the bump.
+ultralytics==8.3.253
 opencv-python-headless==4.11.0.86
 # ultralytics depends on the non-headless opencv-python; pin it to the same
 # version so the two distributions don't install mismatched cv2 modules over

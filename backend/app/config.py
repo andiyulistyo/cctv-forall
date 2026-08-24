@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     #   - CoreML bundle  ("yolo11n.mlpackage",        scripts/export_coreml.py)
     #   - OpenVINO IR    ("yolo11n_openvino_model/",  scripts/export_openvino.py)
     # Both have a FIXED input size, so inference_imgsz must match the export.
+    #
+    # "yolo12*.pt" is accepted too and is what the CUDA profile uses (see
+    # .env.nvidia.example). It stays out of this default on purpose: v12's
+    # area-attention blocks are markedly more expensive on a CPU, and this
+    # default is the one CPU-only and Docker installs fall back to.
     yolo_model: str = "yolo11n.pt"
     # Force a device ("cpu" / "cuda" / "mps" / "0", or "intel:gpu" / "intel:cpu"
     # for an OpenVINO model). Empty string => auto-detect: cuda -> mps -> cpu

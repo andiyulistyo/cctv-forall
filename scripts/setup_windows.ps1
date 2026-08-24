@@ -8,7 +8,7 @@
   a native install is the only way to get hardware acceleration on these
   machines. The script picks a profile from the hardware:
 
-    NVIDIA GPU -> CUDA (torch fp16, yolo11m, EasyOCR and the plate detector
+    NVIDIA GPU -> CUDA (torch fp16, yolo12m, EasyOCR and the plate detector
                   on the GPU as well)
     AMD Ryzen  -> OpenVINO CPU plugin (INT8, uses AVX-512/VNNI on Zen 4)
     Intel Core -> OpenVINO GPU plugin (FP16 on the integrated HD/Iris graphics)
@@ -97,7 +97,12 @@ if ($Hardware -eq 'nvidia') {
     # The GPU has headroom to spare, and at imgsz 640 the medium model costs
     # essentially nothing over the small one -- the bottleneck at that point is
     # the CPU-side letterbox/NMS, not the matmuls.
-    if (-not $YoloModel) { $YoloModel = 'yolo11m.pt' }
+    #
+    # v12 only here. Its area-attention blocks trade throughput for accuracy
+    # (measured on an RTX 5070 Laptop, fp16, imgsz 640: yolo12m 44.6 fps vs
+    # yolo11m 51.9), which a discrete GPU can absorb and the CPU/OpenVINO
+    # profiles below cannot -- so those stay on v11.
+    if (-not $YoloModel) { $YoloModel = 'yolo12m.pt' }
     if ($ImgSz -le 0)    { $ImgSz = 640 }
     $ExportArgs = @()
     $EnvExample = '.env.nvidia.example'
