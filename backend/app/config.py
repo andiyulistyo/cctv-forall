@@ -195,6 +195,21 @@ class Settings(BaseSettings):
     # capturing nothing. A capture only has to show the vehicle, so the floor
     # is much lower. 0 disables it.
     alpr_capture_min_width: int = 48
+    # How much of a vehicle's box must fall inside the ANPR zone before it
+    # counts as being in there, as a fraction of the box's own area.
+    #
+    # The zone used to be tested against a single point -- the bottom centre of
+    # the box, where the vehicle meets the road. On real traffic that admitted
+    # vehicles barely clipping the edge and rejected ones sitting squarely
+    # inside: measured on one taxi leaving the sample alley, boxes 5% and 19%
+    # inside the zone were read (and recorded, twice, under two different
+    # classes), while the frame where the car was 96% inside was skipped because
+    # its wheels sat just past the zone's lower edge.
+    #
+    # 0.5 means "at least half the vehicle is in the zone". Lower it if you draw
+    # tight zones and vehicles are being missed; raise it to demand the vehicle
+    # be well inside. 0 accepts any box that touches the zone at all.
+    alpr_zone_min_overlap: float = 0.5
     # Minimum width, in full-resolution pixels, of a vehicle box before a plate
     # read is attempted on it.
     #

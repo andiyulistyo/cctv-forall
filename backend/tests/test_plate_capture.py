@@ -257,6 +257,56 @@ def test_a_dropped_capture_is_retried_not_lost():
         alpr.release.set()
 
 
+# The taxi that was recorded four times in seven seconds on camera 20, as
+# boxes measured off the saved evidence frames (3840x2160) against the zone the
+# operator had drawn. Only the first is meaningfully inside it.
+ALLEY_ZONE = {"a": [0.10983605382520062, 0.5093687241742849],
+              "b": [0.7147540563487541, 0.9918136834443947]}
+TAXI_BOXES = {                       # track id -> box, and how much is in zone
+    215: ((390, 1182, 1539, 2151), 0.96),
+    216: ((1018, 763, 1701, 1366), 0.44),
+    220: ((1149, 667, 1780, 1198), 0.19),
+    223: ((1258, 639, 1963, 1122), 0.05),
+}
+
+
+def test_zone_overlap_matches_the_measured_frames():
+    """The arithmetic, checked against boxes taken off the real evidence frames."""
+    zone = worker._zone_px(ALLEY_ZONE, 3840, 2160)
+    for track, (box, expected) in TAXI_BOXES.items():
+        got = worker._zone_overlap(box, zone)
+        assert abs(got - expected) < 0.02, (track, got, expected)
+    print("OK zone_overlap_matches_the_measured_frames")
+
+
+def test_only_the_vehicle_actually_in_the_zone_is_read():
+    """The bug from camera 20: one car, four rows, three of them barely in zone."""
+    r = reader(zone=ALLEY_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    verdicts = {t: r._in_zone(f, box) for t, (box, _) in TAXI_BOXES.items()}
+    assert verdicts == {215: True, 216: False, 220: False, 223: False}, verdicts
+    print("OK only_the_vehicle_actually_in_the_zone_is_read: 1 of 4 frames")
+
+
+def test_a_car_whose_wheels_pass_the_lower_edge_is_still_in_the_zone():
+    """The old point test threw this one away -- it is 96% inside."""
+    r = reader(zone=ALLEY_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    box, _ = TAXI_BOXES[215]
+    ground_y = box[3]
+    assert ground_y > ALLEY_ZONE["b"][1] * 2160, "the ground point is below the zone"
+    assert r._in_zone(f, box), "but the car is squarely inside it"
+    print("OK a_car_whose_wheels_pass_the_lower_edge_is_still_in_the_zone")
+
+
+def test_zone_min_overlap_is_configurable():
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    box, _ = TAXI_BOXES[220]                     # 19% inside
+    assert not reader(zone=ALLEY_ZONE, zone_min_overlap=0.5)._in_zone(f, box)
+    assert reader(zone=ALLEY_ZONE, zone_min_overlap=0.1)._in_zone(f, box)
+    print("OK zone_min_overlap_is_configurable")
+
+
 def test_capture_classes_parsing():
     assert _capture_classes("motorcycle") == ("motorcycle",)
     assert _capture_classes(" Motorcycle , bus ") == ("motorcycle", "bus")

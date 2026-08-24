@@ -237,6 +237,22 @@ def _zone_px(zone: dict | None, width: int, height: int) -> tuple[int, int, int,
     return int(x1), int(y1), int(x2), int(y2)
 
 
+def _zone_overlap(box, zone) -> float:
+    """How much of ``box`` lies inside ``zone``, as a fraction of the box area.
+
+    0.0 when they do not meet, 1.0 when the box is wholly inside. Both are
+    ``(x1, y1, x2, y2)`` in the same pixel space.
+    """
+    bx1, by1, bx2, by2 = box
+    zx1, zy1, zx2, zy2 = zone
+    area = max((bx2 - bx1) * (by2 - by1), 0)
+    if area <= 0:
+        return 0.0
+    iw = max(0, min(bx2, zx2) - max(bx1, zx1))
+    ih = max(0, min(by2, zy2) - max(by1, zy1))
+    return (iw * ih) / area
+
+
 def _draw(frame, detections, line_norm, counts: dict, source_cfg: dict, plates: dict, faces=None):
     """Paint the overlay onto ``frame`` in place and return it.
 
@@ -570,6 +586,7 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             capture_classes=_capture_classes(settings.alpr_capture_classes),
             capture_min_width=settings.alpr_capture_min_width,
             zone=source_cfg.get("alpr_zone"),
+            zone_min_overlap=settings.alpr_zone_min_overlap,
             save_frame=settings.alpr_save_frame,
             stationary_seconds=settings.alpr_stationary_seconds,
             reid_gap_seconds=settings.alpr_reid_gap_seconds,
@@ -833,6 +850,7 @@ class _PlateReader:
         capture_classes: tuple[str, ...] = (),
         capture_min_width: int = 0,
         zone: dict | None = None,
+        zone_min_overlap: float = 0.5,
         save_frame: bool = False,
         stationary_seconds: float = 20.0,
         reid_gap_seconds: float = 4.0,
@@ -856,6 +874,7 @@ class _PlateReader:
             )
             self._capture_classes = ()
         self._capture_min_width = max(0, capture_min_width)
+        self._zone_min_overlap = min(1.0, max(0.0, zone_min_overlap))
         self._save_frame = save_frame
         # Last exception type reported, so a persistent fault is logged once
         # rather than once per vehicle per frame.
@@ -919,7 +938,7 @@ class _PlateReader:
                 # a read can succeed, and a vehicle approaching the camera earns
                 # every one of them by getting closer, not by being in view.
                 continue
-            if not self._in_zone(frame, x1, x2, y2):
+            if not self._in_zone(frame, (x1, y1, x2, y2)):
                 continue  # outside the user's read zone; costs no attempt
             if self._vehicles.is_parked(vehicle, now):
                 # Stopped or parked inside the read zone. It was read on the way
@@ -975,7 +994,7 @@ class _PlateReader:
             return  # already recorded; survives the tracker renumbering it
         if x2 - x1 < self._capture_min_width:
             return
-        if not self._in_zone(frame, x1, x2, y2):
+        if not self._in_zone(frame, (x1, y1, x2, y2)):
             return
         if self._vehicles.is_parked(vehicle, now):
             # Parked in the zone. It was captured when it arrived, or it was
@@ -1003,15 +1022,39 @@ class _PlateReader:
         ):
             vehicle.captured = True
 
-    def _in_zone(self, frame, x1: int, x2: int, y2: int) -> bool:
-        """Is the vehicle's ground contact point inside the read zone?"""
+    def _in_zone(self, frame, box) -> bool:
+        """Is enough of the vehicle inside the read zone to call it in there?
+
+        Measured as the fraction of the vehicle's own box that falls inside the
+        zone, which is the plain reading of "the vehicle is in this area".
+
+        This used to test a single point -- the bottom centre of the box, where
+        the vehicle meets the road -- and that turned out to fail in both
+        directions on real traffic. Measured on one taxi driving out of the
+        sample alley, against a zone the operator had drawn over the near half:
+
+            box 5% inside the zone   -> point inside  -> read, and recorded
+            box 19% inside the zone  -> point inside  -> read, and recorded
+            box 96% inside the zone  -> point *outside* (the wheels sat just
+                                        past the zone's lower edge) -> skipped
+
+        So one car leaving the far end of the zone was recorded three times over
+        seven seconds, each time from a different tracker id and sometimes under
+        a different class, while the frame where it was actually in the zone was
+        the one thrown away. A point cannot express "mostly in the zone", and
+        that is the question being asked.
+
+        The reason the old rule preferred the ground point still holds -- the
+        centre of a box floats higher the taller the vehicle, so a bus a lane
+        away would qualify on its centre. An area test keeps that property
+        without the knife edge: that bus overlaps the zone barely at all.
+        """
         if self._zone is None:
             return True
         zone = _zone_px(self._zone, frame.shape[1], frame.shape[0])
         if zone is None:
             return True
-        zx1, zy1, zx2, zy2 = zone
-        return zx1 <= (x1 + x2) / 2.0 <= zx2 and zy1 <= y2 <= zy2
+        return _zone_overlap(box, zone) >= self._zone_min_overlap
 
     def _offer(self, vid: int, job: tuple, evict: bool = True) -> bool:
         """Queue a job; True if it was taken, False if it yielded and was dropped."""

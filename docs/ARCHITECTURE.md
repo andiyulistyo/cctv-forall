@@ -101,7 +101,7 @@ flowchart TB
             STRIDE{"frame_no % frame_stride == 0?"}
             SKIP["Lewati inferensi<br/>frame tetap masuk preview"]
             SCALE["Downscale ke process_width<br/>simpan detect_scale"]
-            DET["Detector.track()<br/>Ultralytics YOLO12 / YOLO11 + ByteTrack"]
+            DET["Detector.track()<br/>Ultralytics YOLO12 / YOLO11 + ByteTrack<br/>agnostic_nms: satu objek satu box"]
             LC["LineCounter<br/>titik kontak roda + pita histeresis"]
             FACE["FaceRecognizer<br/>YuNet deteksi → SFace embedding"]
         end
@@ -162,7 +162,7 @@ Dua tahap: **lokalisasi** lalu **OCR**, dengan dua lapis validasi setelahnya.
 ```mermaid
 flowchart TB
     IN["Box kendaraan hasil tracking<br/>class ∈ ALPR_CLASSES (car, truck, bus)<br/>+ ALPR_CAPTURE_CLASSES (motorcycle) di zona"]
-    W{"Lebar box cukup<br/>dan berada di dalam zona ALPR?"}
+    W{"Lebar box cukup<br/>dan ≥ALPR_ZONE_MIN_OVERLAP bagian kotak<br/>berada di dalam zona ALPR?"}
     ATT{"Percobaan track ini < ALPR_MAX_ATTEMPTS?<br/>tiap ALPR_ATTEMPT_INTERVAL frame"}
     CROP["Crop kendaraan dari frame penuh"]
     PM{"PLATE_MODEL diset?"}
@@ -528,9 +528,12 @@ Semua angka: input 1080p, `imgsz=640`, deteksi saja.
 | Ryzen 7 PRO 7840U | `intel:cpu` OpenVINO INT8 | yolo11s | 44 fps |
 | Core i7 gen-7 (2C/4T, HD Graphics) | `intel:gpu` OpenVINO FP16 | yolo11n, imgsz 480 | batas bawah yang masih layak |
 
-Profil CUDA kemudian pindah ke `yolo12m`. Diukur A/B di RTX 5070 Laptop (fp16,
-imgsz 640, input 1080p, 200 frame): yolo11m **94,5 fps** vs yolo12m **69,3 fps**
-— v12 sekitar 27% lebih lambat, ditukar dengan akurasi kelas.
+Profil CUDA kemudian pindah ke `yolo12m` pada imgsz 960. Diukur A/B di RTX 5070
+Laptop (fp16, input 1080p, 200 frame): yolo11m **94,5 fps** di 640 dan 74,7 di
+960; yolo12m **69,3 fps** di 640 dan **66,9 fps** di 960. Pada imgsz yang sama
+v12 ~27% lebih lambat, tapi 640→960 hanya memakan 3,5% (letterbox + NMS di CPU
+yang mendominasi) dan di situlah v12 berhenti salah menyebut mobil boxy sebagai
+`truck` — kesalahan yang v11 lakukan di semua ukuran.
 
 Perhatikan baris Ryzen: **yang menentukan adalah fps saat dipin ke jatah
 core-nya** (55 fps), bukan fps saat memakai seluruh CPU (73 fps) — di produksi

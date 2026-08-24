@@ -97,7 +97,7 @@ Tiga fakta yang sebenarnya menentukan pilihan hardware:
 | **Batas bawah yang sudah diuji** — 1–2 stream | Core i7 gen-7 (2C/4T) *(terukur)* | 8 GB | iGPU Intel Gen9 (`intel:gpu`) | 20 GB SSD | `yolo11n` FP16, imgsz 480 |
 | 4 stream, tanpa GPU diskrit | 8 core fisik Zen 4 / Intel setara | 16 GB | plugin CPU OpenVINO | 128 GB SSD | `yolo11n` INT8, `FRAME_STRIDE=2`, `EXPECTED_STREAMS=4` |
 | 4–10 stream, hemat daya | Apple M4 / M4 Pro *(terukur)* | 16–24 GB unified | `mps` atau CoreML/ANE | 256 GB SSD | `yolo11s`, `FRAME_STRIDE=2`, VideoToolbox |
-| **2–4 stream, full feature nonstop** | ≥8 core fisik | 16–32 GB | NVIDIA ≥8 GB | 256 GB SSD | `yolo12m` fp16, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
+| **2–4 stream, full feature nonstop** | ≥8 core fisik | 16–32 GB | NVIDIA ≥8 GB | 256 GB SSD | `yolo12m` fp16 imgsz 960, `FRAME_STRIDE=1`, `OCR_DEVICE=cuda` |
 | 6–8 stream, full feature *(ekstrapolasi)* | ≥12 core fisik | 32 GB | NVIDIA 12–16 GB | 512 GB SSD | sama, `EXPECTED_STREAMS` disesuaikan |
 
 Pada baris "minimum absolut", ANPR dan face recognition tetap bisa dinyalakan,
@@ -187,8 +187,9 @@ ditawar lewat konfigurasi.
 Terukur di **RTX 5070 Laptop 8 GB**: `yolo11m` fp16 **90,5 fps**, `yolo11s` fp16
 84,1 fps — versus 43,9 fps di OpenVINO CPU INT8 pada mesin yang sama.
 
-Profil NVIDIA sekarang memakai `yolo12m`, yang menukar sebagian throughput itu
-dengan akurasi — lihat [v11 vs v12](#yolo11-vs-yolo12-di-profil-cuda).
+Profil NVIDIA sekarang memakai `yolo12m` pada imgsz 960 (66,9 fps), yang
+menukar sebagian throughput itu dengan akurasi kelas — lihat
+[v11 vs v12](#yolo11-vs-yolo12-di-profil-cuda).
 
 > ⚠️ **Kecocokan wheel torch.** RTX seri 50 adalah sm_120 (Blackwell) dan
 > memerlukan wheel CUDA 13; wheel cu128 ke bawah tidak punya kernel untuknya.
@@ -463,17 +464,25 @@ baik dan hampir gratis. Itu juga alasan TensorRT bukan prioritas (lihat bawah).
 
 #### YOLO11 vs YOLO12 di profil CUDA
 
-Profil NVIDIA memakai `yolo12m`. Berbeda dari lompatan s→m di atas, v12 **tidak**
-gratis: blok *area-attention*-nya menambah kerja di forward pass, bukan di sisi
-CPU. Diukur A/B pada mesin yang sama, fp16, imgsz 640, input 1080p, 200 frame:
+Profil NVIDIA memakai `yolo12m` pada `INFERENCE_IMGSZ=960`. Berbeda dari
+lompatan s→m di atas, v12 **tidak** gratis: blok *area-attention*-nya menambah
+kerja di forward pass, bukan di sisi CPU. Diukur A/B pada mesin yang sama,
+fp16, input 1080p, 200 frame:
 
-| Model | CUDA fp16 | ms/frame |
+| Model | imgsz 640 | imgsz 960 |
 | --- | --- | --- |
-| yolo11m | **94,5 fps** | 10,6 ms |
-| yolo12m | **69,3 fps** | 14,4 ms |
+| yolo11m | **94,5 fps** | 74,7 fps |
+| yolo12m | 69,3 fps | **66,9 fps** |
 
-Sekitar **27% lebih lambat**, ditukar dengan akurasi — v12 lebih jarang keliru
-menyebut mobil boxy sebagai `truck`.
+Pada imgsz yang sama v12 sekitar **27% lebih lambat**. Yang membayarnya kembali
+adalah akurasi kelas: pada frame bukti yang tersimpan, v11 menyebut satu taksi
+`truck` di **semua** ukuran yang dicoba (0,72–0,83), sementara v12 di 960
+menjawab `car` 0,90. Dua salah-kelas lain di arsip ikut benar di 960
+(`truck` 0,83 → `car` 0,68), dan tidak ada yang berubah jadi salah.
+
+Naik dari 640 ke 960 hanya memakan **3,5%** untuk v12 — pada titik itu letterbox
+dan NMS di CPU yang mendominasi, bukan matmul-nya. Itu sebabnya angka 960 layak
+diambil di sini, dan juga sebabnya TensorRT bukan prioritas (lihat bawah).
 
 Trade ini hanya diambil di profil CUDA. Profil CPU, OpenVINO (Intel/AMD) dan
 macOS tetap di YOLO11: di sana attention jauh lebih mahal, dan dokumentasi
@@ -822,6 +831,7 @@ memang bisa berhasil.
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
 | `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, platnya terbaca atau tidak; isi `motorcycle` untuk motor |
 | `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
+| `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum dibaca/di-capture |
 | `ALPR_SAVE_FRAME` | true | simpan 1 frame penuh (kendaraan dikotaki) per plat terbaca |
 | `ALPR_STATIONARY_SECONDS` | 20 | kendaraan yang diam selama ini dianggap berhenti/parkir dan berhenti dibaca (0 = matikan) |
 | `ALPR_REID_GAP_SECONDS` | 4 | selisih waktu maksimum sebelum box di tempat yang sama dianggap kendaraan **lain** (0 = matikan re-id) |

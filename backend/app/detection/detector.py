@@ -310,6 +310,20 @@ class Detector:
             imgsz=self.imgsz,
             device=self.device,
             half=self.half,
+            # NMS across classes, not within each one. Ultralytics defaults to
+            # per-class NMS, which cannot suppress two boxes that disagree about
+            # what they are -- so one vehicle the model is torn about lands in
+            # the results twice. Measured on a stationary taxi in the sample
+            # alley: truck 0.57 [130,389,513,712] and car 0.48 [130,387,512,712]
+            # -- the same object to within two pixels, kept because they carry
+            # different labels. ByteTrack then tracks both, the line counts both,
+            # and ANPR reads the same plate twice under two different classes.
+            #
+            # The overlap this suppresses is 0.7 IoU, which is far above what a
+            # rider and their motorcycle share (checked on real frames: person
+            # 0.89 and motorcycle 0.73 both survive), so the classes that
+            # genuinely overlap here are unaffected.
+            agnostic_nms=True,
             tracker="bytetrack.yaml",
             verbose=False,
         )
