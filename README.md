@@ -579,10 +579,59 @@ Tiga batasan yang membuatnya aman dipasang di atas setup yang sudah jalan:
   menggeser plate read yang sedang mengantre; kalau antreannya penuh, capture-
   lah yang dibuang. Pembacaan plat opsional yang menyusul sebuah capture baru
   dijalankan kalau antreannya benar-benar kosong.
-- **Sekali per kendaraan, bukan sekali per frame.** Memakai `VehicleRegistry`
-  yang sama dengan ANPR, jadi motor yang berhenti di zona dan terus diganti
-  nomor track-nya tetap satu baris — masalah yang sama yang dulu membuat satu
-  mobil parkir memenuhi daftar plat.
+- **Sekali per kendaraan lewat, bukan sekali per frame.** Memakai
+  `VehicleRegistry` yang sama dengan ANPR, jadi motor yang berhenti di zona dan
+  terus diganti nomor track-nya tetap satu baris — masalah yang sama yang dulu
+  membuat satu mobil parkir memenuhi daftar plat. Dua aturan tambahan menutup
+  kasus yang tidak bisa dijangkau identitas; lihat di bawah.
+
+##### Zona sebagai gerbang, bukan area
+
+`VehicleRegistry` hanya bisa mencegah capture berulang selama ia masih
+*mengenali* kendaraannya, dan pada kamera overview 4K sering kali tidak bisa.
+Terukur di rekaman proyek ini (324 baris dari dua kamera pasar; 59 di antaranya
+jatuh dalam 5 detik dari baris sekelas di kamera yang sama), ada dua cara
+kegagalannya:
+
+- **Tracker mengganti nomor kendaraan yang sudah bergerak terlalu jauh.** Dua
+  capture untuk satu motor (plat `B 6984 NK` di keduanya, jeda 1.19 detik)
+  hanya beririsan **IoU 0.17**; pasangan lain **0.00** — kotaknya sama sekali
+  tidak bersentuhan. Tidak ada re-identifikasi berbasis posisi yang bisa
+  menjangkau itu, dan menurunkan ambangnya sampai bisa justru mulai menggabung
+  kendaraan yang memang berbeda.
+- **Detektor melaporkan satu kendaraan sebagai dua kotak bersarang.** Motor dan
+  pengendaranya kembali sebagai satu kotak untuk keduanya *dan* satu kotak
+  untuk motornya saja, di frame yang sama. Tidak ada penomoran ulang untuk
+  dibatalkan; IoU-nya 0.37, di bawah ambang registry, padahal satu kotak ada
+  seluruhnya di dalam yang lain.
+
+Jadi capture berhenti bertanya "kotak ini milik kendaraan yang mana" dan
+bertanya dua hal yang tetap benar walau tracker-nya tidak bisa diandalkan:
+
+```dotenv
+ALPR_CAPTURE_CONTAINMENT=0.99      # motor harus utuh di dalam zona
+ALPR_CAPTURE_DEDUPE_SECONDS=3.0    # berapa lama capture terakhir diingat
+ALPR_CAPTURE_DEDUPE_OVERLAP=0.8    # ambang "ini kotak yang tadi juga"
+```
+
+**Sudah utuh di dalam zona?** Setiap pasangan duplikat yang terukur punya baris
+pertama 94.8%–98.8% di dalam zona — motor terpotong tepi bawah frame saat mau
+keluar — dan baris kedua tepat 100%. Zona itu gerbang, dan kendaraan yang masih
+menyerempet tepinya belum lewat. Menunggu sampai kotaknya utuh cuma menunda
+satu-dua frame (syaratnya diuji ulang di tiap frame), menghapus seluruh kelas
+duplikat itu, sekaligus menyisakan bukti yang lebih baik: potongan gambar yang
+memperlihatkan motor utuh, bukan separuhnya yang masih di frame.
+
+**Barusan ada kotak yang ini ada di dalamnya?** Kotak bersarang bertumpang
+tindih nyaris penuh kalau diukur terhadap kotak yang lebih kecil — ukuran yang
+justru tidak dilihat IoU. Catatan pendek per kelas tentang apa yang baru saja
+di-capture menangkapnya tanpa perlu tahu identitas sama sekali. Catatan ini
+per kelas, jadi pengendara (`person`) tidak ikut tertelan motor di bawahnya.
+
+Ini tidak berlaku untuk pembacaan plat: sebuah plate read justru mau frame
+paling awal yang platnya terbaca, dan di mana sisa badan kendaraan berada tidak
+mengubah apakah karakternya bisa dieja. `ALPR_ZONE_MIN_OVERLAP` (0.5) tetap
+mengatur itu.
 
 `ALPR_CAPTURE_MIN_WIDTH` sengaja terpisah dari `ALPR_MIN_VEHICLE_WIDTH`: angka
 160 px itu soal apakah *plat*-nya bisa terbaca dan akan menolak hampir semua
@@ -914,7 +963,10 @@ memang bisa berhasil.
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
 | `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, terbaca/dikenali atau tidak; `motorcycle,person` |
 | `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
-| `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum dibaca/di-capture |
+| `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum **dibaca** |
+| `ALPR_CAPTURE_CONTAINMENT` | 0.99 | bagian kendaraan yang harus di dalam zona sebelum **di-capture** — 0.99 ≈ utuh, sisakan 1 px goyangan deteksi |
+| `ALPR_CAPTURE_DEDUPE_SECONDS` | 3.0 | berapa lama sebuah capture diingat untuk dibandingkan dengan capture berikutnya (0 = matikan) |
+| `ALPR_CAPTURE_DEDUPE_OVERLAP` | 0.8 | tumpang tindih (terhadap kotak terkecil) sebelum capture baru dianggap kendaraan yang sama |
 | `ALPR_SAVE_FRAME` | true | simpan 1 frame penuh (kendaraan dikotaki) per plat terbaca |
 | `ALPR_STATIONARY_SECONDS` | 20 | kendaraan yang diam selama ini dianggap berhenti/parkir dan berhenti dibaca (0 = matikan) |
 | `ALPR_REID_GAP_SECONDS` | 4 | selisih waktu maksimum sebelum box di tempat yang sama dianggap kendaraan **lain** (0 = matikan re-id) |
@@ -1040,6 +1092,19 @@ Beberapa hal yang perlu diketahui:
   dan menandai kendaraan yang diam >`ALPR_STATIONARY_SECONDS` sebagai berhenti
   sehingga tidak dibaca ulang sampai ia jalan lagi. Mobil yang cuma berhenti
   sebentar di portal tidak kena: ambang parkirnya belum tercapai.
+- **Kendaraan yang bergerak cepat kadang tidak bisa dikenali sama sekali.**
+  Identitas di atas berhenti bekerja begitu tracker kehilangan kendaraan yang
+  sedang *jalan*: pada kamera 4K yang di-zoom, motor menempuh lebih dari
+  panjang kotaknya sendiri di antara dua deteksi, jadi dua capture untuk satu
+  motor beririsan IoU 0.17 — bahkan 0.00 pada satu pasangan. Tidak ada ambang
+  re-identifikasi yang bisa menjangkau itu tanpa mulai menggabung kendaraan
+  yang memang beda. `capture_gate.py` karena itu tidak bertanya soal identitas:
+  capture baru terjadi kalau kendaraannya **utuh di dalam zona**
+  (`ALPR_CAPTURE_CONTAINMENT`) — setiap pasangan duplikat yang terukur punya
+  baris pertama 94.8–98.8% di dalam zona dan baris kedua tepat 100% — dan
+  kotaknya bukan kotak yang **barusan** di-capture
+  (`ALPR_CAPTURE_DEDUPE_SECONDS`), yang menutup kasus satu motor dilaporkan
+  detektor sebagai dua kotak bersarang di frame yang sama.
 - **YouTube live sering tersendat dari sananya.** Diukur pada stream CCTV live
   (hanya tersedia HLS): tanpa deteksi sama sekali, hanya decoding, tetap ada
   11–12 jeda >0.5 detik per 75 detik dengan jeda terpanjang **14 detik** — sama

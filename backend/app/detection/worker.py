@@ -32,6 +32,7 @@ from ..models import (  # noqa: F401
 )
 from ..runtime import apply_worker_threads, pin_worker_affinity, threads_per_worker
 from .alpr import ALPR
+from .capture_gate import CaptureGate
 from .detector import Detector, gpu_thread_cap, plan_inference
 from .face import FaceRecognizer, face_bbox
 from .ffmpeg_log import summarize_ffmpeg_noise
@@ -588,6 +589,9 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             capture_min_width=settings.alpr_capture_min_width,
             zone=source_cfg.get("alpr_zone"),
             zone_min_overlap=settings.alpr_zone_min_overlap,
+            capture_containment=settings.alpr_capture_containment,
+            capture_dedupe_seconds=settings.alpr_capture_dedupe_seconds,
+            capture_dedupe_overlap=settings.alpr_capture_dedupe_overlap,
             person_sink=_person_sink(source_id, fstate),
             save_frame=settings.alpr_save_frame,
             stationary_seconds=settings.alpr_stationary_seconds,
@@ -887,6 +891,9 @@ class _PlateReader:
         capture_min_width: int = 0,
         zone: dict | None = None,
         zone_min_overlap: float = 0.5,
+        capture_containment: float = 0.99,
+        capture_dedupe_seconds: float = 3.0,
+        capture_dedupe_overlap: float = 0.8,
         person_sink=None,
         save_frame: bool = False,
         stationary_seconds: float = 20.0,
@@ -912,6 +919,16 @@ class _PlateReader:
             self._capture_classes = ()
         self._capture_min_width = max(0, capture_min_width)
         self._zone_min_overlap = min(1.0, max(0.0, zone_min_overlap))
+        # Captures are judged on a stricter reading of the same zone than plate
+        # reads are. A read wants the earliest frame the plate is legible in and
+        # does not care where the rest of the vehicle is; a capture is a record
+        # of a passage, and half a vehicle at the edge of the zone is the frame
+        # that gets recorded twice. See ``capture_gate``.
+        self._gate = CaptureGate(
+            min_containment=capture_containment,
+            window=capture_dedupe_seconds,
+            min_overlap=capture_dedupe_overlap,
+        )
         # Where a person capture goes. Vehicles are plate rows; a person is a
         # face sighting, and the worker owns that decision -- this class only
         # decides *whether* something in the zone is worth recording.
@@ -1027,13 +1044,22 @@ class _PlateReader:
         self._vehicles.prune(now)
 
     def _maybe_capture(self, vehicle, det, frame, box, now: float, faces=()) -> None:
-        """Record a capture-class vehicle the first time it is seen in zone.
+        """Record a capture-class vehicle the once it is through the zone.
 
-        Runs the same gauntlet as a plate read -- zone, size, parked -- and for
-        the same reasons, but answers a different question: not "can we read
-        this plate" but "did this vehicle pass through here". So it fires once
-        per *vehicle* rather than once per attempt, and the row it writes is
+        Runs a stricter version of the plate read's gauntlet -- zone, size,
+        parked -- because it answers a different question: not "can we read this
+        plate" but "did this vehicle pass through here". So it fires once per
+        *passage* rather than once per attempt, and the row it writes is
         complete on its own with plate_text left empty.
+
+        Three things have to agree that this is a passage we do not already
+        have. ``vehicle.captured`` is the cheap one and catches the ordinary
+        case. The other two are there because on a zoomed-in camera the tracker
+        loses vehicles often enough that identity alone does not hold: the gate
+        will not take a vehicle that is only half inside the zone, and it
+        remembers what it captured a moment ago so one vehicle reported as two
+        nested boxes is not recorded twice. See ``capture_gate`` for the
+        measurements behind both.
 
         Deliberately cheap and non-competitive. It queues no OCR of its own;
         the read, if any, is attempted by the worker thread only when nothing
@@ -1045,7 +1071,14 @@ class _PlateReader:
             return  # already recorded; survives the tracker renumbering it
         if x2 - x1 < self._capture_min_width:
             return
-        if not self._in_zone(frame, (x1, y1, x2, y2)):
+        if not self._through_zone(frame, (x1, y1, x2, y2)):
+            return
+        if self._gate.is_repeat(det.class_name, (x1, y1, x2, y2), now):
+            # The same vehicle again under a box we do not recognise as its
+            # own -- most often the detector reporting a rider and a machine as
+            # one box and then as two. Not marked captured: this vehicle may
+            # yet turn out to be a different one that merely arrived where the
+            # last one was, and the ledger forgets in a few seconds either way.
             return
         if self._vehicles.is_parked(vehicle, now):
             # Parked in the zone. It was captured when it arrived, or it was
@@ -1072,6 +1105,7 @@ class _PlateReader:
             evict=False,
         ):
             vehicle.captured = True
+            self._gate.record(det.class_name, (x1, y1, x2, y2), now)
 
     def _in_zone(self, frame, box) -> bool:
         """Is enough of the vehicle inside the read zone to call it in there?
@@ -1106,6 +1140,31 @@ class _PlateReader:
         if zone is None:
             return True
         return _zone_overlap(box, zone) >= self._zone_min_overlap
+
+    def _through_zone(self, frame, box) -> bool:
+        """Is the vehicle all the way inside the read zone, not merely touching it?
+
+        The capture-side counterpart to :meth:`_in_zone`, and stricter for a
+        reason worth keeping straight. A plate read wants the *earliest* frame
+        the plate is legible in; where the rest of the vehicle happens to be
+        does not affect whether the characters can be made out, so a half-in
+        vehicle is worth a read. A capture is a claim that a vehicle came past,
+        and a vehicle straddling the edge of the zone is the frame that gets
+        claimed twice -- once on the way in under one tracker id and again a
+        second later under another, by which time it has moved too far for the
+        registry to know it is the same machine.
+
+        Unlike ``_in_zone`` this returns False with no zone drawn rather than
+        True: capture is zone-only by design, and the constructor has already
+        turned the feature off in that case. Guarding here as well keeps the
+        rule true of this method on its own.
+        """
+        if self._zone is None:
+            return False
+        zone = _zone_px(self._zone, frame.shape[1], frame.shape[0])
+        if zone is None:
+            return False
+        return self._gate.is_through(box, zone)
 
     def _offer(self, vid: int, job: tuple, evict: bool = True) -> bool:
         """Queue a job; True if it was taken, False if it yielded and was dropped."""

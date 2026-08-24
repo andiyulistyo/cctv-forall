@@ -209,7 +209,61 @@ class Settings(BaseSettings):
     # 0.5 means "at least half the vehicle is in the zone". Lower it if you draw
     # tight zones and vehicles are being missed; raise it to demand the vehicle
     # be well inside. 0 accepts any box that touches the zone at all.
+    #
+    # This governs plate *reads* only. Captures use the stricter floor below.
     alpr_zone_min_overlap: float = 0.5
+    # How much of a vehicle must be inside the ANPR zone before it is captured,
+    # measured against the smaller of the vehicle box and the zone.
+    #
+    # Separate from alpr_zone_min_overlap, and much stricter, because the two
+    # settings answer different questions. A plate read wants the earliest frame
+    # the plate is legible in; where the rest of the vehicle sits is beside the
+    # point, so half a vehicle is worth a read. A capture is a record that a
+    # vehicle came past, and a vehicle straddling the edge of the zone is
+    # exactly the one that gets recorded twice -- once as it enters under one
+    # tracker id, again a second later under another, by which time it has
+    # moved too far for the vehicle registry to recognise it.
+    #
+    # Measured on this project's own recordings: of 59 rows that landed within
+    # five seconds of a same-class row from the same camera, every duplicated
+    # pair had a first row 94.8%-98.8% inside the zone -- a motorcycle clipped
+    # by the bottom edge of the frame -- and a second at exactly 100%.
+    #
+    # 0.99 is "all of it, bar a pixel of detector jitter at the zone edge", and
+    # separates the two cleanly: those clipped first rows scored 0.9485-0.9859,
+    # while a box overhanging the edge by a single pixel scores 0.9978. 1.0
+    # demands literally every pixel, which costs nothing but a frame or two --
+    # the gate is re-tested on every frame of the passage. Lowering it towards
+    # alpr_zone_min_overlap widens the gate back into a region and brings the
+    # duplicates back with it; the cost of raising it is that a vehicle which
+    # never fits wholly inside the zone is never captured, so draw the zone
+    # with room for the largest vehicle you care about.
+    alpr_capture_containment: float = 0.99
+    # How long a capture is remembered, in seconds, for comparison against the
+    # next one of the same class from the same camera.
+    #
+    # This is the second half of duplicate suppression, and it catches what
+    # neither the zone rule nor the vehicle registry can: one vehicle reported
+    # by the detector as two nested boxes in the *same* frame -- a motorcycle
+    # and its rider as one box, and the machine alone as another. There is no
+    # renumbering to undo there and no gap to re-identify across, and the two
+    # boxes score IoU 0.37, under the registry's threshold, while one sits
+    # entirely inside the other.
+    #
+    # Keep it short. It exists to span the frame or two in which one vehicle is
+    # reported twice, not to police a queue of traffic: every second of it is a
+    # second in which a genuinely different vehicle arriving in the same place
+    # goes unrecorded. 0 turns this half off and leaves the zone rule alone.
+    alpr_capture_dedupe_seconds: float = 3.0
+    # How much a new capture must overlap a remembered one to be treated as the
+    # same vehicle, measured against the smaller of the two boxes.
+    #
+    # Measured on the smaller box on purpose: a nested detection scores 1.0 that
+    # way and only 0.37 by IoU, which is the whole reason the registry misses
+    # it. 0.8 means "one of these boxes is almost entirely inside the other".
+    # Lower it and vehicles that merely pass close to one another start being
+    # merged; raise it towards 1.0 and only exact nesting is caught.
+    alpr_capture_dedupe_overlap: float = 0.8
     # Minimum width, in full-resolution pixels, of a vehicle box before a plate
     # read is attempted on it.
     #

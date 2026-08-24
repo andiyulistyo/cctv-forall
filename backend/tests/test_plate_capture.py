@@ -170,6 +170,88 @@ def test_renumbered_motorcycle_is_not_captured_twice():
     print("OK renumbered_motorcycle_is_not_captured_twice: id 1 -> 2 captured once")
 
 
+# The motorcycle recorded twice on camera 22, as boxes measured off its two
+# saved evidence frames (3840x2160) against the zone that camera's operator had
+# drawn. Both rows carry the plate B 6984 NK, 1.19 s apart, under tracker ids
+# 155 and 157. Their boxes overlap by IoU 0.17, far under the registry's
+# re-identification threshold, so nothing about identity could have joined them:
+# by the time the tracker had renumbered the bike it had moved most of its own
+# length. What separates them is how far into the zone each one is.
+GATE_ZONE = {"a": [0.2512294893744052, 0.5879570433314069],
+             "b": [0.7786884793796988, 0.9983627100408214]}
+BIKE_ENTERING = (1492, 1952, 1769, 2159)   # 98.6% in zone: clipped by the frame
+BIKE_THROUGH = (1492, 1702, 1725, 2037)    # 100%: the whole machine, in the zone
+
+
+def test_a_bike_straddling_the_zone_edge_is_not_captured_yet():
+    """The first of the two rows: recorded on the way out, cut off by the frame."""
+    r = reader(zone=GATE_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [bike(track_id=155, x1=BIKE_ENTERING[0], y1=BIKE_ENTERING[1],
+                      x2=BIKE_ENTERING[2], y2=BIKE_ENTERING[3])])
+    assert r.offered == [], r.offered
+    print("OK a_bike_straddling_the_zone_edge_is_not_captured_yet")
+
+
+def test_the_bike_is_captured_once_it_is_wholly_through():
+    """...and the second row, which is the one worth keeping: the whole bike."""
+    r = reader(zone=GATE_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [bike(track_id=155, x1=BIKE_ENTERING[0], y1=BIKE_ENTERING[1],
+                      x2=BIKE_ENTERING[2], y2=BIKE_ENTERING[3])])
+    next_frame(r)
+    # Renumbered to 157, as the tracker actually did, and now wholly in the zone.
+    r.submit(f, [bike(track_id=157, x1=BIKE_THROUGH[0], y1=BIKE_THROUGH[1],
+                      x2=BIKE_THROUGH[2], y2=BIKE_THROUGH[3])])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+    print("OK the_bike_is_captured_once_it_is_wholly_through: 1 row, not 2")
+
+
+# The other way one bike became two rows, on camera 20 this time: the detector
+# returned the rider and machine together as one box (track 7) and the machine
+# alone as another (track 8), 43 ms apart, both wholly inside the zone. They
+# score IoU 0.37 -- under the registry's threshold -- so the zone rule cannot
+# help here and the ledger has to.
+RIDER_AND_BIKE = (1294, 1191, 1601, 1787)
+BIKE_ALONE = (1378, 1294, 1571, 1639)
+
+
+def test_one_bike_reported_as_two_nested_boxes_is_captured_once():
+    r = reader(zone=ALLEY_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [
+        bike(track_id=7, x1=RIDER_AND_BIKE[0], y1=RIDER_AND_BIKE[1],
+             x2=RIDER_AND_BIKE[2], y2=RIDER_AND_BIKE[3]),
+        bike(track_id=8, x1=BIKE_ALONE[0], y1=BIKE_ALONE[1],
+             x2=BIKE_ALONE[2], y2=BIKE_ALONE[3]),
+    ])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+    print("OK one_bike_reported_as_two_nested_boxes_is_captured_once")
+
+
+def test_two_bikes_side_by_side_are_both_captured():
+    """The ledger must suppress a repeat, not the second half of the traffic."""
+    r = reader(zone=ALLEY_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [
+        bike(track_id=11, x1=1294, y1=1191, x2=1601, y2=1787),
+        bike(track_id=12, x1=1900, y1=1191, x2=2207, y2=1787),  # alongside it
+    ])
+    assert [o[0] for o in r.offered] == ["capture", "capture"], r.offered
+    print("OK two_bikes_side_by_side_are_both_captured")
+
+
+def test_the_gate_can_be_widened_back_to_a_region():
+    """Operators with a tight zone need the old behaviour available."""
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    entering = bike(track_id=155, x1=BIKE_ENTERING[0], y1=BIKE_ENTERING[1],
+                    x2=BIKE_ENTERING[2], y2=BIKE_ENTERING[3])
+    r = reader(zone=GATE_ZONE, capture_containment=0.5)
+    r.submit(f, [entering])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+    print("OK the_gate_can_be_widened_back_to_a_region")
+
+
 def test_a_capture_never_evicts_a_plate_read():
     """The guarantee that ALPR_CLASSES keeps the budget it had before."""
     r = reader()
