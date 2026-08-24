@@ -367,6 +367,25 @@ class Settings(BaseSettings):
     # --- Streaming ---
     mjpeg_fps: int = 15
     jpeg_quality: int = 70
+    # Draw detection and face boxes only where they meet the ANPR zone.
+    #
+    # On a camera pointed down a street, most of what is detected is traffic
+    # the source is not being watched for, and the boxes for it are most of
+    # what ends up on screen. With a zone drawn, this holds the overlay to it:
+    # a box is drawn if any part of it touches the zone, so a vehicle arriving
+    # at the edge is still visible -- that is the frame worth seeing -- while
+    # anything plainly elsewhere is not.
+    #
+    # A display setting, and only that. It changes nothing about what is
+    # detected, tracked, counted, read or captured; those still cover the whole
+    # frame. Worth being clear about because it is easy to expect otherwise:
+    # inference is the expensive step and it runs on the whole frame before any
+    # of this, so the saving here is a few OpenCV rectangle calls per frame --
+    # real but small. What actually moves the load is FRAME_STRIDE,
+    # INFERENCE_IMGSZ and the size of YOLO_MODEL.
+    #
+    # No effect on a source with no ANPR zone drawn.
+    draw_only_in_zone: bool = True
 
     @property
     def db_path(self) -> Path:

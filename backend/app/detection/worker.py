@@ -255,6 +255,20 @@ def _zone_overlap(box, zone) -> float:
     return (iw * ih) / area
 
 
+def _touches_zone(box, zone) -> bool:
+    """Does any part of ``box`` fall inside ``zone``?
+
+    Deliberately "any part at all" rather than a share of the box. This decides
+    what is *drawn*, and the thing an operator watching a gate needs to see
+    first is a vehicle arriving at its edge -- the frame before it is inside is
+    the interesting one, and a threshold would blank exactly that. Anything
+    plainly elsewhere in the picture overlaps by nothing and goes.
+    """
+    bx1, by1, bx2, by2 = box
+    zx1, zy1, zx2, zy2 = zone
+    return min(bx2, zx2) > max(bx1, zx1) and min(by2, zy2) > max(by1, zy1)
+
+
 def _draw(frame, detections, line_norm, counts: dict, source_cfg: dict, plates: dict, faces=None):
     """Paint the overlay onto ``frame`` in place and return it.
 
@@ -272,6 +286,17 @@ def _draw(frame, detections, line_norm, counts: dict, source_cfg: dict, plates: 
             frame, "ANPR", (zone[0] + 4, max(12, zone[1] + 16)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45, _ZONE_COLOR, 1, cv2.LINE_AA,
         )
+
+    # With a zone drawn, the overlay can be held to it: boxes elsewhere in the
+    # picture are traffic this source is not being watched for, and on a wide
+    # camera they are most of what is on screen. Counting and ANPR are
+    # deliberately left alone -- this hides boxes, it does not stop detecting.
+    if settings.draw_only_in_zone and zone is not None:
+        detections = [d for d in detections if _touches_zone((d.x1, d.y1, d.x2, d.y2), zone)]
+        faces = [
+            f for f in (faces or [])
+            if _touches_zone((f[0], f[1], f[0] + f[2], f[1] + f[3]), zone)
+        ]
 
     # Counting line
     if line_norm is not None:

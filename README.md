@@ -949,6 +949,7 @@ memang bisa berhasil.
 | `CAPTURE_BUFFER_SECONDS` | 2 | jitter buffer untuk HLS/YouTube (RAM: ±83 MB/detik pada 720p) |
 | `MAX_STREAM_LATENCY_SECONDS` | 0.5 | batas ketertinggalan dari live sebelum reader lompat ke frame terbaru (0 = jangan lompat) |
 | `MJPEG_FPS` | 15 | frame per detik yang dikirim ke browser |
+| `DRAW_ONLY_IN_ZONE` | true | gambar box deteksi/wajah hanya yang menyentuh zona ANPR — **tampilan saja**, deteksi & hitungan tetap satu frame penuh |
 | `JPEG_QUALITY` | 70 | kualitas JPEG stream |
 | `OCR_DEVICE` | *(auto)* | perangkat EasyOCR; MPS sengaja tetap di CPU |
 | `CONF_THRESHOLD` | 0.35 | ambang confidence deteksi |
