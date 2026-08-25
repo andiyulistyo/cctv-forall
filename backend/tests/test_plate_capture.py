@@ -6,11 +6,18 @@ read its plate" ends up recorded as "nothing came past". ALPR_CAPTURE_CLASSES
 records the passage itself: the vehicle crop and the frame go in, plate_text
 stays empty, and a plate fills it in later if one can be read.
 
-The two properties worth defending are the ones that are easy to break later:
+A class in ALPR_CLASSES may be listed here too, and then it gets both. That is
+what a car needs after dark, when its plate is as unreadable as a motorcycle's:
+it is still read on every frame it is close enough for, and if none of those
+reads lands the passage is a row anyway.
+
+The properties worth defending are the ones that are easy to break later:
 
 * a capture happens **only inside the zone** -- with no zone drawn, not at all;
 * a capture **never takes a plate read's place** in the queue, so the classes
-  in ALPR_CLASSES keep exactly the OCR budget they had before.
+  in ALPR_CLASSES keep exactly the OCR budget they had before;
+* a capture **never overwrites a plate already read** -- both paths correct one
+  row, and the row with the plate in it is the one that must survive.
 
 Run from the backend/ directory:  python -m tests.test_plate_capture
 """
@@ -285,13 +292,101 @@ def test_classes_not_configured_for_capture_are_untouched():
     print("OK classes_not_configured_for_capture_are_untouched")
 
 
-def test_a_read_class_is_read_not_captured():
-    """Listed in both settings, a class keeps its full attempt budget."""
+def test_a_read_class_is_captured_as_well():
+    """Listed in both settings, a class gets both -- captured, then read.
+
+    This is what a car needs after dark. Its plate is in ALPR_CLASSES, so it is
+    tried on every frame it is close enough for; when none of those tries lands
+    -- measured on this camera, 0 of 16 cars through the zone at night against
+    17 of 22 in daylight -- the passage has to be a row anyway, exactly as a
+    motorcycle's is.
+
+    The read comes a frame later than the capture, and the stub _offer does not
+    mark the vehicle pending the way the real one does, so this test does it
+    itself.
+    """
     r = reader(classes=("car", "motorcycle"), capture_classes=("motorcycle",),
                min_vehicle_width=0)
+    stub = r._offer
+
+    def record(vid, job, evict=True):
+        r._pending.add(vid)          # as the real _offer does, before the put
+        return stub(vid, job, evict)
+
+    r._offer = record
+
     r.submit(frame(), [bike()])
+    assert [o[0] for o in r.offered] == ["capture"], r.offered
+
+    r._pending.clear()               # the ANPR thread finishes the capture
+    next_frame(r)
+    r.submit(frame(), [bike()])
+    assert [o[0] for o in r.offered] == ["capture", "read"], r.offered
+    print("OK a_read_class_is_captured_as_well: capture first, read after")
+
+
+# Camera 20 and 22 (sources 6 and 7) as their operator has them drawn, and two
+# cars measured off saved 3840x2160 evidence frames against those zones. The
+# first is a car driving through the alley -- wholly inside the zone, 1074 px
+# wide. The second is the car parked in the carport at the left edge of camera
+# 22, which sits outside the zone in every frame it appears in.
+CAM20_ZONE = {"a": [0.019791666666666666, 0.39093567875416707],
+              "b": [0.9875, 0.9976875985529052]}
+CAM22_ZONE = {"a": [0.14166666666666666, 0.39093567875416707],
+              "b": [0.9114583333333334, 0.9976875985529052]}
+CAR_THROUGH_ALLEY = (741, 1151, 1815, 2132)     # 100% in zone
+CAR_PARKED_IN_CARPORT = (1, 1590, 296, 2148)    # 0% in zone
+
+
+def both_lists(**kw):
+    r = reader(classes=("car", "truck", "bus"),
+               capture_classes=("car", "truck", "motorcycle", "person"), **kw)
+    return r
+
+
+def test_a_car_through_the_zone_is_captured_and_still_read():
+    """The night case, on the geometry it actually has to work on."""
+    r = both_lists(zone=CAM20_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [Detection(21, "car", 0.94, *CAR_THROUGH_ALLEY)])
+    # Captured for having come past, and still read: the plate is worth trying
+    # for, it just must not be the only thing that leaves a trace.
+    assert [o[0] for o in r.offered] == ["capture", "read"], r.offered
+    print("OK a_car_through_the_zone_is_captured_and_still_read")
+
+
+def test_a_car_parked_outside_the_zone_is_not_captured():
+    """Capture is zone-only for cars too -- the carport is not the alley."""
+    r = both_lists(zone=CAM22_ZONE)
+    f = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    r.submit(f, [Detection(22, "car", 0.90, *CAR_PARKED_IN_CARPORT)])
+    assert r.offered == [], r.offered
+    print("OK a_car_parked_outside_the_zone_is_not_captured")
+
+
+def test_a_capture_never_overwrites_a_plate_already_read():
+    """A read that landed first is already the row for this passage.
+
+    _do_capture writes empty plate text into ``vehicle.row_id``, so a capture
+    firing after a successful read would not add a row -- it would blank the
+    one holding the plate. Reading continues; only the capture stands down.
+    """
+    r = reader(classes=("car",), capture_classes=("car",), min_vehicle_width=0,
+               attempt_interval=1)
+    r.submit(frame(), [car()])
+    vehicle = next(iter(r._vehicles._vehicles.values()))
+    # As the ANPR thread leaves it when a plate is read: a row of its own, and
+    # a confidence still short of _PLATE_GOOD_ENOUGH_CONF so reads carry on.
+    vehicle.captured = False
+    vehicle.row_id = 42
+    vehicle.best_conf = 0.5
+    vehicle.attempts = 0
+    r.offered.clear()
+
+    next_frame(r)
+    r.submit(frame(), [car()])
     assert [o[0] for o in r.offered] == ["read"], r.offered
-    print("OK a_read_class_is_read_not_captured")
+    print("OK a_capture_never_overwrites_a_plate_already_read")
 
 
 class BlockingALPR:

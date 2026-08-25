@@ -97,6 +97,40 @@ def test_superseded_images_are_cleaned_up():
         assert not (settings.data_dir / rel).exists(), f"orphan left behind: {rel}"
 
 
+def test_a_capture_row_is_filled_in_by_a_later_read():
+    """A car recorded unread, then read: one row, not two.
+
+    The whole reason a read class is captured at all -- a car whose plate the
+    night defeats still has to be a row -- rests on the plate landing on that
+    same row when one is finally made out. The follow-up read carries no
+    snapshot of its own, so the evidence frame the capture wrote has to survive
+    it.
+    """
+    from app.models import PlateRead
+
+    row_id = worker._persist_plate(
+        9, 42, "car", "", 0.0, _img(10), snapshot=_img(20), box=(1, 1, 30, 30),
+    )
+    assert row_id is not None
+    _, captured_frame = _paths_on_disk(row_id)
+
+    same = worker._persist_plate(
+        9, 42, "car", "B1234XYZ", 0.70, _img(11), snapshot=None,
+        box=(1, 1, 30, 30), row_id=row_id,
+    )
+    assert same == row_id, "the read must fill the capture's row, not add one"
+
+    db = worker.SessionLocal()
+    try:
+        rows = db.query(PlateRead).filter(PlateRead.source_id == 9).all()
+        assert len(rows) == 1, f"{len(rows)} rows for one passage"
+        assert rows[0].plate_text == "B1234XYZ", rows[0].plate_text
+        assert rows[0].frame_path == captured_frame, "the evidence frame was dropped"
+    finally:
+        db.close()
+    _paths_on_disk(row_id)
+
+
 if __name__ == "__main__":
     tmp = Path(tempfile.mkdtemp())
     engine = _swap_data_dir(tmp)
