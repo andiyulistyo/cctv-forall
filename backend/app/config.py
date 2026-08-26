@@ -330,6 +330,22 @@ class Settings(BaseSettings):
     # recognition net is small and some of its ops fall back to the CPU anyway,
     # so sharing the GPU with YOLO usually costs more than it gains.
     ocr_device: str = ""
+    # Size a plate crop is enlarged to before OCR, when it is smaller. This
+    # replaces a width-only rule that never fired on the crops that needed it:
+    # a motorcycle crop can be 569 px wide while the plate inside it is 60 px
+    # across. Enlarging under 1.5x is skipped outright -- interpolation softens
+    # every edge, and a marginal resize costs more sharpness than it buys.
+    ocr_min_height: int = 64
+    ocr_min_width: int = 240
+    # Confidence at which OCR stops trying further preprocessings of the same
+    # crop. Matches ALPR_* good-enough handling in the worker: a read that
+    # stops the vehicle being retried has nothing to gain from more variants.
+    ocr_good_enough: float = 0.75
+    # Ceiling on OCR passes for one crop. The plate queue is short and drops
+    # what it cannot keep up with, so an unreadable crop grinding through every
+    # preprocessing costs other vehicles their turn. Raise it only if plates
+    # are being missed *and* the queue is not backing up.
+    ocr_max_passes: int = 8
 
     # --- Face recognition (OpenCV YuNet + SFace) ---
     face_enabled: bool = True

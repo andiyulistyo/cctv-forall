@@ -533,6 +533,10 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             plate_conf=settings.plate_conf_threshold,
             min_confidence=settings.plate_min_confidence,
             half=settings.inference_half,
+            ocr_min_height=settings.ocr_min_height,
+            ocr_min_width=settings.ocr_min_width,
+            good_enough=settings.ocr_good_enough,
+            max_passes=settings.ocr_max_passes,
         )
         if not alpr.available:
             alpr = None

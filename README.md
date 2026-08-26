@@ -536,8 +536,9 @@ per worker.
   CRNN), jadi ikut pindah tanpa perubahan kode.
 - **Detektor plat khusus** — `PLATE_MODEL` diarahkan ke fine-tune YOLO11
   ([morsetechlab/yolov11-license-plate-detection](https://huggingface.co/morsetechlab/yolov11-license-plate-detection),
-  diunduh otomatis oleh setup script). Tanpa ini `alpr.py` memakai heuristik
-  "ambil 45% bawah box kendaraan", yang merupakan sumber salah-baca terbesar.
+  diunduh otomatis oleh setup script). Tanpa ini `alpr.py` menebak sendiri
+  daerah platnya (crop utuh, lalu pita bawah kendaraan) — bisa jalan, tapi
+  detektor khusus tetap peningkatan akurasi terbesar yang bisa Anda pasang.
   Di GPU biayanya nyaris nol.
 - **Motor direkam walau platnya tidak terbaca** — `ALPR_CAPTURE_CLASSES=motorcycle`,
   lihat bagian di bawah.
@@ -587,6 +588,59 @@ Tiga batasan yang membuatnya aman dipasang di atas setup yang sudah jalan:
   terus diganti nomor track-nya tetap satu baris — masalah yang sama yang dulu
   membuat satu mobil parkir memenuhi daftar plat. Dua aturan tambahan menutup
   kasus yang tidak bisa dijangkau identitas; lihat di bawah.
+
+##### Membaca plat motor
+
+Merekam motornya satu hal, membaca platnya hal lain. Diukur pada empat capture
+motor dari kamera persimpangan proyek ini, OCR lama mengembalikan **nol** teks
+pada dua gambar dan hanya stempel masa berlaku (`06-3G`, `08-28`) pada dua
+sisanya — padahal platnya terbaca jelas oleh mata. Tiga sebabnya, dan
+ketiganya sudah diperbaiki di `alpr.py` tanpa mengubah alur capture di atas:
+
+- **ROI-nya membuang platnya.** Aturan lama selalu "45% bawah crop". Pada crop
+  yang isinya *sudah* plat, 45% bawah itu justru barisan masa berlaku, bukan
+  nomornya — persis kegagalan dua gambar tadi. Sekarang ROI berupa daftar
+  kandidat (kotak dari detektor plat, crop utuh, lalu pita bawah), dan yang
+  benar-benar terbaca yang dipakai.
+- **Tidak ada yang diperbesar.** Syarat lama `lebar < 200 px` tidak pernah
+  terpenuhi oleh crop motor selebar 569 px yang platnya cuma 60 px. Ukuran
+  sekarang dinilai dari pita platnya, bukan crop di sekelilingnya.
+- **Gambarnya masuk OCR apa adanya.** CLAHE dan terutama *bilateral filter*
+  yang menjaga tepi huruf adalah pembeda antara terbaca dan salah baca pada
+  crop JPEG kecil.
+
+Selain itu, kotak-kotak teks kini digabung **per baris**. Plat motor Indonesia
+punya jarak lebar antara kode wilayah, angka dan akhiran, sehingga EasyOCR
+kerap melaporkan `B 6084 TXB` sebagai dua–tiga kotak terpisah; tak satu pun
+berbentuk plat sendirian, jadi penilaian per kotak membuangnya semua.
+Menggabung *semua* kotak juga salah — stempel masa berlaku ikut terlem di
+belakang (`B6084TXB0829`) dan gagal uji panjang. Baris adalah satuan yang
+memang berupa plat.
+
+Yang tidak berubah: **plat salah tetap lebih buruk daripada tidak ada plat.**
+Karena beberapa varian pra-proses dijalankan, ambang lama jadi lebih gampang
+tertembus kebetulan — pada satu gambar yang platnya memang tidak terbaca, tiap
+varian mengarang plat berbentuk sah yang *berbeda-beda* di 0.21–0.26. Karena
+itu bacaan yang tidak didukung varian lain harus berdiri sendiri di ambang yang
+lebih tinggi; tiap varian yang menyetujui bacaan sama menurunkan ambang itu,
+sampai paling rendah kembali ke `PLATE_MIN_CONFIDENCE`. Hasilnya pada empat
+sampel tadi: satu terbaca persis, satu meleset satu karakter, dan dua yang
+platnya memang tak terbaca sekarang **tidak** menuliskan tebakan apa pun.
+
+Empat setelan baru, semuanya opsional:
+
+```dotenv
+OCR_MIN_HEIGHT=64      # crop plat diperbesar sampai setinggi ini sebelum OCR
+OCR_MIN_WIDTH=240
+OCR_GOOD_ENOUGH=0.75   # bacaan seyakin ini menghentikan varian berikutnya
+OCR_MAX_PASSES=8       # batas pass OCR per crop
+```
+
+`OCR_MAX_PASSES` yang menjaga biayanya: antrean plat cuma delapan dalam dan
+membuang yang tak terkejar, jadi crop tak terbaca yang menjelajahi semua tahap
+bukan sekadar lambat — ia memakan giliran kendaraan lain. Plat mobil bersih
+tetap selesai dalam **satu** pass; hanya plat yang gagal di tahap murah yang
+membayar sisanya.
 
 ##### Zona sebagai gerbang, bukan area
 
