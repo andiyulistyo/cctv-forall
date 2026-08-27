@@ -24,6 +24,7 @@ export default function AddSourceModal({
   const [classes, setClasses] = useState<string[]>(["car", "truck", "motorcycle"]);
   const [alpr, setAlpr] = useState(true);
   const [face, setFace] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -41,6 +42,7 @@ export default function AddSourceModal({
         enabled_classes: classes,
         alpr_enabled: alpr,
         face_enabled: face,
+        auto_start: autoStart,
       });
       onCreated();
       onClose();
@@ -101,10 +103,22 @@ export default function AddSourceModal({
           Baca plat nomor (ANPR) untuk kendaraan
         </label>
 
-        <label className="mb-4 flex items-center gap-2 text-sm text-slate-300">
+        <label className="mb-2 flex items-center gap-2 text-sm text-slate-300">
           <input type="checkbox" checked={face} onChange={(e) => setFace(e.target.checked)} />
           Pengenalan wajah (face recognition)
         </label>
+
+        <label className="mb-1 flex items-center gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={autoStart}
+            onChange={(e) => setAutoStart(e.target.checked)}
+          />
+          Jalan otomatis saat aplikasi start
+        </label>
+        <p className="mb-4 text-xs text-slate-500">
+          Source ini dinyalakan sendiri setelah komputer reboot — tanpa perlu klik Start.
+        </p>
 
         {error && <div className="mb-3 text-sm text-red-400">{error}</div>}
 

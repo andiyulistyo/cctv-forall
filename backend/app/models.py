@@ -74,6 +74,12 @@ class Source(Base):
     alpr_enabled: Mapped[bool] = mapped_column(Integer, default=1)
     face_enabled: Mapped[bool] = mapped_column(Integer, default=0)
 
+    # Start this source again by itself when the app starts. Workers are child
+    # processes and do not survive a restart, so after a reboot every source is
+    # stopped -- fine on a desktop where someone is watching, useless on a
+    # machine in a cabinet that just came back from a power cut.
+    auto_start: Mapped[bool] = mapped_column(Integer, default=0)
+
     # Runtime status: stopped | starting | running | error
     status: Mapped[str] = mapped_column(String(20), default="stopped")
     status_message: Mapped[str | None] = mapped_column(Text, nullable=True)

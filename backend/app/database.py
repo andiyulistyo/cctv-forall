@@ -44,14 +44,17 @@ def get_db():
         db.close()
 
 
-# Columns added after a release, as (table, column, SQLite type). Adding one to
-# a model is not enough on its own: create_all() only creates missing *tables*,
-# so an existing database keeps its old shape and every query touching the new
-# column fails at runtime. SQLite's ALTER TABLE ADD COLUMN is the whole
-# migration story here -- it is cheap, and appending a nullable column never
-# rewrites the table.
+# Columns added after a release, as (table, column, SQLite column definition).
+# Adding one to a model is not enough on its own: create_all() only creates
+# missing *tables*, so an existing database keeps its old shape and every query
+# touching the new column fails at runtime. SQLite's ALTER TABLE ADD COLUMN is
+# the whole migration story here -- it is cheap, and appending a column with a
+# constant default never rewrites the table.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("sources", "alpr_zone", "JSON"),
+    # NOT NULL DEFAULT 0 rather than a bare INTEGER: existing rows would
+    # otherwise read back as None, and SourceOut.auto_start is a bool.
+    ("sources", "auto_start", "INTEGER NOT NULL DEFAULT 0"),
     ("plate_reads", "frame_path", "TEXT"),
     ("face_sightings", "frame_path", "TEXT"),
 )
@@ -59,14 +62,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
 
 def _add_missing_columns() -> None:
     with engine.begin() as conn:
-        for table, column, column_type in _ADDED_COLUMNS:
+        for table, column, definition in _ADDED_COLUMNS:
             rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
             if not rows:
                 continue  # table does not exist yet; create_all just made it
             if column in {r[1] for r in rows}:
                 continue
             conn.exec_driver_sql(
-                f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
 
 

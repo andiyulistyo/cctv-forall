@@ -27,6 +27,8 @@ export interface Source {
   enabled_classes: string[];
   alpr_enabled: boolean;
   face_enabled: boolean;
+  /** Start this source again by itself when the backend starts (after a reboot). */
+  auto_start: boolean;
   line: { a: number[]; b: number[] } | null;
   /** Where plates are read. Two opposite corners, normalized 0..1. null = anywhere. */
   alpr_zone: { a: number[]; b: number[] } | null;

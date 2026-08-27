@@ -72,6 +72,7 @@ def create_source(payload: SourceCreate, db: Session = Depends(get_db)) -> Sourc
         enabled_classes=payload.enabled_classes,
         alpr_enabled=1 if payload.alpr_enabled else 0,
         face_enabled=1 if payload.face_enabled else 0,
+        auto_start=1 if payload.auto_start else 0,
         status="stopped",
     )
     db.add(src)
@@ -108,6 +109,8 @@ def update_source(source_id: int, payload: SourceUpdate, db: Session = Depends(g
         src.alpr_enabled = 1 if payload.alpr_enabled else 0
     if payload.face_enabled is not None:
         src.face_enabled = 1 if payload.face_enabled else 0
+    if payload.auto_start is not None:
+        src.auto_start = 1 if payload.auto_start else 0
     db.commit()
     db.refresh(src)
     return _to_out(src, get_manager())

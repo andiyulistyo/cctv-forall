@@ -27,6 +27,9 @@ lalu lintas (mobil, orang, truk, motor, bus) dari berbagai sumber video, dengan
   (sighting) ke DB. Ringan & OpenCV-native (**YuNet** deteksi + **SFace**
   embedding), toggle per source. Wajah asing = "unknown".
 - 🗄️ **Penyimpanan lokal (SQLite)** dengan **retensi otomatis 7 hari**.
+- 🔁 **Pulih sendiri**: Scheduled Task Windows menjalankan backend tiap boot,
+  dan source bercentang *Auto start* ikut menyala tanpa disentuh — lihat
+  [Autostart di Windows](#autostart-di-windows-jalan-sendiri-saat-os-menyala-).
 - 🔐 **Login** (satu admin, JWT).
 - 🐳 **Docker** untuk distribusi mudah (CPU & GPU).
 
@@ -434,6 +437,9 @@ curl http://localhost:8000/api/health
 Setup script memeriksa GPU **sebelum** vendor CPU. Laptop NVIDIA hampir selalu
 ber-CPU AMD atau Intel, dan memilih profil dari CPU di situ akan menyiapkan
 plugin CPU OpenVINO lalu membiarkan kartu diskritnya menganggur.
+
+Supaya dashboard hidup sendiri tiap komputer menyala, lihat
+[Autostart di Windows](#autostart-di-windows-jalan-sendiri-saat-os-menyala-).
 
 ⚠️ **Wheel torch harus cocok dengan kartunya.** RTX seri 50 adalah sm_120
 (Blackwell) dan build cu128 ke bawah tidak punya kernel untuknya — terpasang
@@ -877,6 +883,9 @@ mengunduh bobot, meng-export IR OpenVINO, dan menyalin `.env.amd.example` atau
 `.env.intel.example` menjadi `.env`. Paksa profil dengan
 `.\scripts\setup_windows.ps1 -Hardware intel`.
 
+Supaya dashboard hidup sendiri tiap komputer menyala, lihat
+[Autostart di Windows](#autostart-di-windows-jalan-sendiri-saat-os-menyala-).
+
 Cek device yang benar-benar dipakai:
 
 ```powershell
@@ -931,6 +940,116 @@ Plugin GPU OpenVINO hanya mendukung GPU Intel (`Core().available_devices` di
 karena ultralytics tidak pernah mendaftarkan `DmlExecutionProvider`. Karena
 plugin CPU dengan INT8 sudah memberi 2.2×, kompleksitas itu tidak sepadan.
 
+## Autostart di Windows (jalan sendiri saat OS menyala) 🔁
+
+Untuk pemasangan di lapangan dashboard harus hidup lagi sendiri setelah listrik
+mati — tanpa ada yang login dan tanpa jendela PowerShell yang harus dibiarkan
+terbuka. Itu dikerjakan oleh **Scheduled Task**, bukan shortcut di folder
+Startup: hanya task yang bisa jalan *sebelum* logon, dihidupkan ulang otomatis
+kalau proses mati, dan tidak ikut tertutup saat console ditutup.
+
+```powershell
+# PowerShell sebagai Administrator, dari root repo
+.\scripts\install_autostart_windows.ps1
+```
+
+Setelah itu backend hidup di `http://localhost:8000` setiap kali komputer boot.
+Sebelum memasang, pastikan `.\scripts\setup_windows.ps1` sudah pernah
+dijalankan (task memakai `backend\.venv` yang sama dengan `run_windows.ps1`).
+
+Yang dipasang:
+
+| Bagian | Isi |
+| --- | --- |
+| Nama task | `DetectionDashboard` (ubah dengan `-TaskName`) |
+| Trigger | saat boot, ditunda 30 detik (`-DelaySeconds`) supaya driver & jaringan sempat siap |
+| Akun | user Anda lewat S4U — jalan walau belum login, dan **password tidak disimpan** |
+| Aksi | `scripts\service_windows.ps1` → `uvicorn app.main:app --workers 1` |
+| Log | `data\logs\backend.log` (dirotasi begitu lewat 20 MB — juga selagi backend jalan; satu file lama disimpan sebagai `backend.log.1`) |
+| Jika crash | supervisor mengulang 5s → 10s → 20s → 30s; kalau 5 kali gagal dalam 5 menit ia menyerah dan Task Scheduler mencoba lagi tiap 1 menit |
+
+Opsi yang sering dipakai:
+
+```powershell
+.\scripts\install_autostart_windows.ps1 -Port 9000
+.\scripts\install_autostart_windows.ps1 -OpenFirewall     # buka TCP dari LAN (profil Private/Domain)
+.\scripts\install_autostart_windows.ps1 -RunAs System     # jalan sebagai LocalSystem
+.\scripts\install_autostart_windows.ps1 -Trigger Logon    # tanpa hak admin: jalan saat Anda login
+.\scripts\install_autostart_windows.ps1 -NoStart          # daftarkan saja, jangan mulai sekarang
+```
+
+`-RunAs CurrentUser` (default) menjaga akses ke apa pun yang terpasang khusus
+untuk akun Anda — cache model di home directory, instalasi CUDA/OpenVINO
+per-user. `-RunAs System` lepas dari akun Anda sepenuhnya, tetapi tidak melihat
+hal-hal tersebut.
+
+Mengecek dan mengelola:
+
+```powershell
+.\scripts\install_autostart_windows.ps1 -Status
+Get-Content data\logs\backend.log -Tail 50 -Wait
+```
+
+### Mematikan sementara (tanpa menghapus task)
+
+Kadang autostart-nya perlu dimatikan dulu: ada demo di port yang sama, driver
+mau di-update, kamera sedang dibongkar, atau mesinnya harus tenang semalam.
+Untuk itu **jangan** pakai `-Uninstall` — itu menghapus task-nya, jadi
+menghidupkannya lagi berarti mendaftar ulang dan memilih ulang akun, port, dan
+aturan firewall. Pakai skrip ini; task, akun, dan firewall tetap utuh, hanya
+sakelarnya yang dimatikan:
+
+```powershell
+# PowerShell as Administrator (task dengan trigger boot itu machine-wide)
+.\scripts\disable_autostart_windows.ps1              # mati sekarang & saat boot
+.\scripts\disable_autostart_windows.ps1 -KeepRunning # mati untuk boot berikutnya saja
+.\scripts\disable_autostart_windows.ps1 -Status      # lihat sakelarnya
+.\scripts\disable_autostart_windows.ps1 -Enable      # hidupkan lagi + start sekarang
+.\scripts\disable_autostart_windows.ps1 -Enable -NoStart
+```
+
+Tanpa `-KeepRunning`, disable juga **menghentikan backend yang sedang jalan** —
+backend yang tetap melayani sampai reboot berikutnya tidak bisa disebut "mati".
+Skrip menunggu sampai portnya benar-benar lepas, dan memberi tahu kalau ternyata
+masih dipegang proses lain (mis. `run_windows.ps1` yang dijalankan manual — port
+itu memang bukan milik task).
+
+`-Status` memisahkan dua hal yang gampang tertukar:
+
+```
+Autostart: disabled          <- sakelarnya: apakah nanti nyala sendiri
+State    : Running           <- prosesnya sekarang
+Backend  : listening on 8000
+```
+
+Kalau memang mau dihapus permanen: `.\scripts\install_autostart_windows.ps1 -Uninstall`.
+
+### Supaya source ikut nyala sendiri
+
+Server hidup belum berarti deteksi jalan: worker adalah proses anak yang mati
+bersama aplikasi, jadi setiap start semua source ditandai `stopped`. Centang
+**Auto start** pada kartu source di dashboard (ada juga di halaman detail dan
+di form Tambah Source) — source bercentang itu dinyalakan lagi sendiri setiap
+backend start, jadi setelah reboot tidak ada yang perlu ditekan.
+
+- Source dinyalakan **berurutan dengan jeda 3 detik**
+  (`AUTO_START_STAGGER_SECONDS` di `backend/app/main.py`). Spawn satu worker
+  berarti satu interpreter baru yang memuat torch dan modelnya; melepas empat
+  sekaligus di mesin yang baru saja boot hanya membuat keempatnya lambat.
+- Prosesnya di thread terpisah, jadi dashboard sudah bisa dibuka selagi
+  worker-worker naik. Status source `starting` sampai frame pertama masuk.
+- Satu source yang gagal naik **tidak menghentikan sisanya**: yang gagal
+  ditandai `error` berikut pesannya di dashboard, sisa antrean tetap
+  dijalankan. Di mesin tanpa operator tidak ada yang bisa menyalakan sisanya
+  secara manual — itu justru inti dari centang ini.
+- Source tanpa centang tetap manual — memang itu gunanya centang ini.
+
+Uji logikanya: `cd backend && PYTHONPATH=. python tests/test_auto_start.py`.
+
+⚠️ Port 8000 hanya bisa dipakai satu proses. Kalau task sudah hidup,
+`run_windows.ps1` akan gagal — matikan dulu task-nya dengan
+`.\scripts\disable_autostart_windows.ps1`, lalu `-Enable` kalau sudah selesai.
+
 ## Menjalankan tanpa Docker (development)
 
 **Backend:**
@@ -956,7 +1075,9 @@ otomatis menyajikan `frontend/dist`.
 
 1. **Login**.
 2. **+ Tambah Source** → pilih tipe (mis. YouTube), tempel URL, centang objek
-   (mis. Mobil, Truk, Motor), aktifkan ANPR bila perlu → Simpan.
+   (mis. Mobil, Truk, Motor), aktifkan ANPR bila perlu → Simpan. Centang
+   **Jalan otomatis saat aplikasi start** untuk kamera yang harus hidup terus
+   (lihat [Autostart di Windows](#autostart-di-windows-jalan-sendiri-saat-os-menyala-)).
 3. Klik **Start** pada kartu source. Thumbnail live muncul.
 4. Buka **Detail** → tab **Atur Garis Hitung** → klik dua titik untuk menggambar
    garis melintang jalan, beri label arah (mis. `masuk`/`keluar`) → **Simpan

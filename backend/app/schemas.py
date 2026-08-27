@@ -69,6 +69,8 @@ class SourceBase(BaseModel):
     enabled_classes: list[str] = Field(default_factory=lambda: ["car", "truck", "motorcycle"])
     alpr_enabled: bool = True
     face_enabled: bool = False
+    # Resume this source on app start (see Source.auto_start).
+    auto_start: bool = False
 
     def validate_semantics(self) -> None:
         if self.type not in SOURCE_TYPES:
@@ -88,6 +90,7 @@ class SourceUpdate(BaseModel):
     enabled_classes: list[str] | None = None
     alpr_enabled: bool | None = None
     face_enabled: bool | None = None
+    auto_start: bool | None = None
 
 
 class SourceOut(SourceBase):

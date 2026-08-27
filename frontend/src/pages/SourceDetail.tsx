@@ -67,9 +67,23 @@ export default function SourceDetail() {
         <h1 className="text-2xl font-semibold">{source.name}</h1>
         <StatusBadge status={source.status} />
         <span className="text-xs uppercase text-slate-500">{source.type}</span>
+        <label
+          className="ml-auto flex items-center gap-2 text-sm text-slate-400"
+          title="Dinyalakan sendiri setiap backend start, mis. setelah komputer reboot"
+        >
+          <input
+            type="checkbox"
+            checked={source.auto_start}
+            onChange={async (e) => {
+              await api.updateSource(sourceId, { auto_start: e.target.checked });
+              loadSource();
+            }}
+          />
+          Auto start
+        </label>
         <button
           onClick={toggle}
-          className="ml-auto rounded bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500"
+          className="rounded bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500"
         >
           {running ? "Stop" : "Start"}
         </button>

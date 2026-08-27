@@ -32,6 +32,18 @@ export default function Dashboard() {
     load();
   };
 
+  const setAutoStart = async (s: Source, value: boolean) => {
+    // Paint the new state first: the list only reloads every 4 seconds, and a
+    // checkbox that stays on its old value after a click reads as ignored.
+    setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, auto_start: value } : x)));
+    try {
+      await api.updateSource(s.id, { auto_start: value });
+    } catch (err: any) {
+      setError(err.message);
+    }
+    load();
+  };
+
   const remove = async (s: Source) => {
     if (!confirm(`Hapus source "${s.name}"?`)) return;
     await api.deleteSource(s.id);
@@ -97,6 +109,17 @@ export default function Dashboard() {
                     </span>
                   ))}
                 </div>
+                <label
+                  className="mt-2 flex w-fit items-center gap-2 text-xs text-slate-400"
+                  title="Dinyalakan sendiri setiap backend start, mis. setelah komputer reboot"
+                >
+                  <input
+                    type="checkbox"
+                    checked={s.auto_start}
+                    onChange={(e) => setAutoStart(s, e.target.checked)}
+                  />
+                  Auto start
+                </label>
                 {s.status_message && (
                   /* A message on a source that is still running is a warning
                      (mis. frame yang hilang karena stream terlalu berat), bukan

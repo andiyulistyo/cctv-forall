@@ -265,6 +265,7 @@ erDiagram
         json alpr_zone
         bool alpr_enabled
         bool face_enabled
+        bool auto_start "dinyalakan lagi saat app start"
         string status
         text status_message
         datetime created_at

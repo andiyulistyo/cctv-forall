@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import signal
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from .auth import ensure_admin_user
 from .config import settings
@@ -53,6 +54,82 @@ def _install_shutdown_signal_handlers() -> None:
             continue
 
 
+# Seconds between two auto-started workers. Spawning one is a fresh
+# interpreter that loads torch and the model; releasing four at the same
+# instant on a machine that has only just booted makes all four slower.
+AUTO_START_STAGGER_SECONDS = 3.0
+
+
+def _resume_auto_start_sources() -> threading.Thread | None:
+    """Start the sources marked ``auto_start``, off the startup path.
+
+    Spawning a worker costs a second or two, so doing this inline would keep
+    the dashboard unreachable for as long as all of them together take --
+    exactly when someone is reloading the page to see whether the machine came
+    back. The thread is a daemon and checks SHUTTING_DOWN between starts, so a
+    Ctrl-C part-way through a slow resume still exits.
+
+    Returns the thread (None if nothing is marked) so tests can wait for it.
+    """
+    db = SessionLocal()
+    try:
+        pending = [
+            (src.id, sources.build_source_cfg(src))
+            for src in db.scalars(
+                select(Source).where(Source.auto_start == 1).order_by(Source.id)
+            )
+        ]
+    finally:
+        db.close()
+    if not pending:
+        return None
+
+    def _mark(source_id: int, status: str, message: str | None = None) -> None:
+        """Write a status back, swallowing whatever the write hits.
+
+        A locked database is not a reason to abandon the sources further down
+        the list: the row is only what the dashboard displays, while the worker
+        it describes is already up.
+        """
+        db = SessionLocal()
+        try:
+            db.execute(
+                update(Source)
+                .where(Source.id == source_id)
+                .values(status=status, status_message=message)
+            )
+            db.commit()
+        except Exception as exc:  # pragma: no cover - depends on the DB
+            print(f"[auto-start] source {source_id}: status not saved ({exc})")
+        finally:
+            db.close()
+
+    def _resume() -> None:
+        mgr = get_manager()
+        for index, (source_id, cfg) in enumerate(pending):
+            # wait() returns True only if the event was set, i.e. we are
+            # shutting down; a plain sleep would ignore that for 3 seconds.
+            if index and SHUTTING_DOWN.wait(AUTO_START_STAGGER_SECONDS):
+                return
+            if SHUTTING_DOWN.is_set():
+                return
+            # One source that refuses to spawn must not strand the rest. There
+            # is nobody at an unattended machine to start the others by hand --
+            # that is the whole point of the flag -- so record the failure the
+            # way a worker does and carry on down the list.
+            try:
+                mgr.start(cfg)
+            except Exception as exc:
+                print(f"[auto-start] source {source_id}: start failed ({exc})")
+                _mark(source_id, "error", f"auto-start gagal: {exc}")
+                continue
+            _mark(source_id, "starting")
+
+    thread = threading.Thread(target=_resume, name="auto-start", daemon=True)
+    thread.start()
+    return thread
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -65,6 +142,8 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     init_manager()
+    # ...and then bring back the ones that are supposed to run unattended.
+    _resume_auto_start_sources()
     start_scheduler()
     _install_shutdown_signal_handlers()
     try:
