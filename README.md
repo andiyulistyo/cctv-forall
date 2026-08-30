@@ -22,11 +22,17 @@ lalu lintas (mobil, orang, truk, motor, bus) dari berbagai sumber video, dengan
   program hanya mencoba di situ. Setiap pembacaan juga menyimpan **satu frame
   penuh** dengan kendaraannya dikotaki, supaya bisa dipastikan plat itu menempel
   pada kendaraan yang mana.
+- 🔍 **Tinjauan & akurasi OCR**: koreksi hasil baca plat langsung dari dashboard
+  (ketik nomor sebenarnya, Enter, lompat ke berikutnya). Koreksinya disimpan
+  **terpisah** dari teks OCR, sehingga pasangan (prediksi, kebenaran) tetap utuh
+  — dan menu **Akurasi OCR** memakainya untuk menghitung akurasi nyata kamera
+  Anda, menunjukkan karakter apa yang paling sering tertukar, kamera mana yang
+  paling buruk, dan mengekspor dataset berlabel sebagai `.zip`.
 - 🧑 **Pengenalan wajah (face recognition)**: daftarkan orang (nama + foto),
   sistem mengenali wajah pada stream (label nama) dan mencatat kemunculan
   (sighting) ke DB. Ringan & OpenCV-native (**YuNet** deteksi + **SFace**
   embedding), toggle per source. Wajah asing = "unknown".
-- 🗄️ **Penyimpanan lokal (SQLite)** dengan **retensi otomatis 7 hari**.
+- 🗄️ **Penyimpanan lokal (SQLite)** dengan **retensi otomatis 7 hari** — kecuali pembacaan yang sudah ditinjau manusia, yang tidak pernah dihapus.
 - 🔁 **Pulih sendiri**: Scheduled Task Windows menjalankan backend tiap boot,
   dan source bercentang *Auto start* ikut menyala tanpa disentuh — lihat
   [Autostart di Windows](#autostart-di-windows-jalan-sendiri-saat-os-menyala-).
@@ -636,8 +642,8 @@ platnya memang tak terbaca sekarang **tidak** menuliskan tebakan apa pun.
 Empat setelan baru, semuanya opsional:
 
 ```dotenv
-OCR_MIN_HEIGHT=64      # crop plat diperbesar sampai setinggi ini sebelum OCR
-OCR_MIN_WIDTH=240
+OCR_MIN_HEIGHT=160     # crop plat diperbesar sampai sebesar ini sebelum OCR
+OCR_MIN_WIDTH=600
 OCR_GOOD_ENOUGH=0.75   # bacaan seyakin ini menghentikan varian berikutnya
 OCR_MAX_PASSES=8       # batas pass OCR per crop
 ```
@@ -647,6 +653,46 @@ membuang yang tak terkejar, jadi crop tak terbaca yang menjelajahi semua tahap
 bukan sekadar lambat — ia memakan giliran kendaraan lain. Plat mobil bersih
 tetap selesai dalam **satu** pass; hanya plat yang gagal di tahap murah yang
 membayar sisanya.
+
+###### Kenapa 160/600, bukan 64/240
+
+Angka lama menelan justru kasus yang paling umum. `_upscale` melewati
+pembesaran di bawah 1.5x — masuk akal, karena interpolasi tipis lebih banyak
+melunakkan tepi daripada menambah detail. Tapi terhadap target 64/240, crop
+plat **median** dari kamera ini (172x74 px) meminta 240/172 = **1.40x**, jatuh
+tepat di bawah ambang itu, dan diserahkan ke OCR tanpa diperbesar sama sekali.
+**57% crop yang ditinjau** mendarat di celah itu.
+
+Akibatnya terlihat di data: separuh pembacaan mengembalikan karakter **lebih
+sedikit** dari yang ada di plat — bukan salah baca, tapi tidak terlihat.
+
+Diukur dengan memutar ulang 94 pembacaan yang sudah ditinjau dari frame
+tersimpannya, lewat ladder yang sama persis:
+
+| `MIN_HEIGHT`/`MIN_WIDTH` | 64/240 | 128/480 | **160/600** | 192/720 | 224/840 | 256/960 |
+|---|---|---|---|---|---|---|
+| terbaca persis | 16.3% | 18.6% | **23.3%** | 19.8% | 14.0% | 10.5% |
+| bacaan kurang karakter | 36 | 23 | **25** | 30 | 35 | 34 |
+
+Kurva U terbalik yang bersih. Lewat ~600 px interpolasi mulai mengarang detail
+dan hasilnya lebih buruk daripada tidak melakukan apa-apa. Suku **lebar** yang
+menentukan pada crop berbentuk plat (`600/w` selalu melampaui `160/h` untuk
+apa pun yang lebih lebar daripada tinggi), jadi setelan ini sebenarnya berkata
+*"tunjukkan plat selebar ±600 px ke OCR"* — dan mendarat di tempat yang sama
+baik crop-nya datang selebar 172 px maupun 226 px.
+
+> Pada 86 pembacaan yang bisa diskor, ayunan +9/−3 di balik puncak itu bersifat
+> **menunjukkan arah, belum menyelesaikan perkara**. Ukur ulang lewat halaman
+> Akurasi OCR setelah tinjauan bertambah.
+
+Satu hal yang **tidak** membantu, supaya tidak dicoba lagi: memberi padding
+pada kotak detektor plat. `_detector_roi` memotong kotak YOLO mentah tanpa
+margin, dan dugaan wajarnya adalah kotak yang terlalu rapat memangkas huruf
+area di depan. Diukur pada 108 frame yang sama dengan padding 0/10/16/25%:
+16.3% → 11.6% → 16.3% → 18.6%. Tidak ada sinyal — 4 membaik, 4 memburuk pada
+16%. Pada padding 25% seluruh plat beserta tepi kirinya terlihat, dan huruf
+yang dikira terpotong memang tidak ada di sana (terhalang tiang, bukan
+terpotong crop). Masalahnya resolusi, bukan framing.
 
 ##### Zona sebagai gerbang, bukan area
 
@@ -786,6 +832,279 @@ sekarang menyala. `VehicleRegistry` hanya bisa menyatukan kendaraan lewat IoU,
 dan itu memang gagal untuk kendaraan cepat: track 215, 220 dan 223 pada taksi
 tadi kotaknya sudah tidak beririsan sama sekali. Ketiganya membaca teks yang
 sama persis, jadi jaring inilah yang menangkapnya.
+
+### Satu kendaraan, satu bacaan: voting antar-frame
+
+Satu kendaraan dibaca sampai `ALPR_MAX_ATTEMPTS` kali saat menyeberang zona, dan
+setiap pembacaan adalah tebakan atas string **yang sama**. Dulu hanya yang
+confidence-nya paling tinggi yang disimpan, sisanya dibuang — padahal justru di
+sisanya jawabannya berada.
+
+Confidence OCR menyatakan seberapa bersih decoder menyelesaikan **satu gambar**;
+ia tidak menyatakan apa pun tentang seberapa mungkin string itu adalah platnya.
+Jadi kasus ini dulu diputuskan terbalik:
+
+```
+8 frame membaca  B1234XYZ  @ 0.70
+1 frame membaca  B1234XY2  @ 0.72     <- yang ini yang tersimpan
+```
+
+Sekarang semua pembacaan **memilih, per karakter, berbobot confidence**
+(`app/detection/plate_vote.py`). Delapan suara mengalahkan satu, dan yang
+tersimpan adalah `B1234XYZ`.
+
+Bagian yang tidak sepele adalah **penjajaran kolom**. Panjang string berbeda
+antar pembacaan — frame yang kehilangan huruf wilayah membaca `1234XYZ`, dan
+memilih kolom-per-kolom melawan `B1234XYZ` akan menempatkan `1` di bawah `B`
+lalu salah di setiap posisi. Maka pembacaan dikelompokkan dulu per **bentuk**
+(berapa huruf wilayah, berapa angka, berapa huruf belakang); hanya yang sebentuk
+yang dibandingkan per kolom, dan bentuk dengan total confidence terbesar yang
+menang.
+
+Efek sampingnya menarik: plat bisa terbaca benar **walau tidak satu frame pun
+membacanya utuh**. Lima frame, masing-masing salah di tempat berbeda, tetap
+punya mayoritas yang jelas di setiap kolom.
+
+Dua konsekuensi yang perlu diketahui:
+
+- **`ALPR_READ_ALL_ATTEMPTS=true` (default)** — kendaraan terus dibaca sampai
+  jatahnya habis, bukan berhenti di pembacaan pertama yang meyakinkan. Suara
+  yang tidak pernah dikumpulkan tidak bisa ikut memilih. Biayanya nyata: antrean
+  OCR hanya delapan dalam dan membuang yang tak tertangani, jadi di kamera yang
+  sangat ramai matikan opsi ini — pembacaan **pertama** mobil berikutnya lebih
+  berharga daripada pembacaan kesembilan mobil ini.
+- **Gambar dan teks berpisah.** Teks berasal dari voting; crop dan frame bukti
+  tetap dari pembacaan tunggal paling jernih, karena konsensus yang dirakit
+  lintas frame tidak punya gambar milik sendiri. Label plat yang tergambar di
+  frame bukti bisa tertinggal satu-dua pembacaan di belakang teks barisnya; ia
+  menyusul begitu ada crop yang lebih baik.
+
+### Kenapa motor lebih sering gagal terbaca
+
+Dua sebabnya struktural, dan keduanya tidak ada hubungannya dengan platnya.
+
+**1. Motor hanya dapat satu kali percobaan OCR.** Motor ada di
+`ALPR_CAPTURE_CLASSES`, bukan `ALPR_CLASSES` — jadi ia direkam sebagai
+*capture*, dan pembacaan platnya dicoba **sekali**, itu pun hanya kalau antrean
+OCR kebetulan sedang kosong pada detik itu. Satu frame motor yang bergerak itu
+lempar koin: platnya miring, kena motion blur, atau separuh tertutup kaki
+pengendara. Tidak ada kesempatan kedua, dan tidak ada apa pun untuk divoting.
+
+`ALPR_CAPTURE_READ_ATTEMPTS` (default 8) memberi kesempatan itu. Percobaannya
+**tetap subordinat**: satu hanya diantrekan saat antrean OCR benar-benar
+kosong, jadi persimpangan yang ramai tetap menghabiskan seluruh jatahnya untuk
+`ALPR_CLASSES` persis seperti sebelumnya — trade-off yang dulu diukur dan kalah
+(motor 77% dari lalu lintas, nol pembacaan, tapi memakan 77% jatah) tidak
+kembali. Hasilnya masuk ke voting per karakter yang sama dengan kendaraan lain
+dan mengoreksi baris yang sudah ditulis capture-nya. Set 0 untuk mengembalikan
+perilaku satu-tembakan.
+
+**2. Gambar yang tersimpan adalah motornya, bukan platnya.** Ini yang terlihat
+di kolom **Plat (crop)**: sebuah motor utuh, bukan plat. Padahal detektor plat
+biasanya **menemukan** platnya dengan yakin justru di frame yang gagal dibaca
+OCR — diukur pada satu capture motor:
+
+```
+detektor plat : box (200,130)-(358,200)  158x70px  conf=0.822
+tersimpan dulu: 540x364  (motor utuh)
+tersimpan kini: 158x70   (platnya)
+```
+
+Tiga hal membaca gambar itu dan ketiganya dulu disodori gambar yang salah:
+thumbnail di listing, orang yang meninjau dan mengoreksinya, dan dataset yang
+diekspor — yang justru memfilekan contoh paling berharganya (pembacaan yang
+salah) sebagai foto kendaraan. Seluruh pemandangannya tidak hilang: itu frame
+bukti, memang untuk itu ia ada.
+
+### Batas EasyOCR pada plat motor
+
+Perbaikan di atas menaikkan peluang, bukan menembus dinding. Pada capture motor
+yang platnya jelas terbaca mata manusia (`B 5440 TEF`), **tidak satu pun**
+kombinasi ini membacanya benar:
+
+| yang dicoba | hasil |
+|---|---|
+| 6 tingkat upscale (1.5× sampai 6×) | `5LL0` / `5220` / `5L20` |
+| 4 preprocessing × 3 alfabet | idem |
+| padding box detektor 0–15% | idem |
+| beam search vs greedy | identik |
+| alfabet angka-saja pada blok angka | `5240` — terdekat, masih salah |
+
+Polanya selalu sama: `TEF` benar, blok angkanya hancur — **"4" dibaca "L"**.
+Tabel perbaikan di `alpr.py` sengaja tidak memetakan `L`, dan komentarnya
+menjelaskan alasannya: `L` juga bentuk salah-baca `1`, jadi memetakannya akan
+salah separuh waktu.
+
+Ini bukan masalah pipeline. Ini batas CRNN latin generik EasyOCR pada font plat
+Indonesia di ukuran ini — dan justru kasus konkret untuk recognizer khusus plat,
+yang memutuskan `4` lawan `1` lewat prior posisi-digit yang terlatih di dalam
+modelnya. Ukur dulu seberapa sering ini terjadi di kamera Anda lewat halaman
+**Akurasi OCR**; capture motor yang platnya kini tersimpan rapi adalah persis
+data latih yang dibutuhkan penggantinya. Slot untuk memasang penggantinya ada
+di `OCR_RECOG_NETWORK` — lihat [Memasang recognizer hasil
+latih](#memasang-recognizer-hasil-latih-).
+
+## Meninjau & mengoreksi hasil baca 🔍
+
+Ini satu-satunya cara sistem ini punya **ground truth** — dan tanpanya, tidak
+ada satu pun kalimat tentang "akurasi ANPR" di halaman ini yang bisa dibuktikan.
+
+**Alurnya:**
+
+1. Buka **Plat Nomor**, pilih filter **Belum ditinjau**.
+2. Klik nomor plat (atau thumbnail kendaraannya). Modal terbuka dengan crop plat
+   ukuran besar dan frame penuh — dua-duanya di layar sekaligus, karena dari
+   baris tabel saja platnya memang tidak terbaca.
+3. Isi nomor sebenarnya, tekan **Enter**. Tersimpan, lalu langsung lompat ke
+   pembacaan berikutnya. Kolom sudah terisi jawaban terbaik yang ada, jadi
+   pembacaan yang memang benar cukup ditekan Enter tanpa mengetik apa pun.
+4. Plat yang **memang tidak terbaca** → tombol **Tidak terbaca**. Ini jawaban
+   yang sah dan berguna: ia menahan crop tak terbaca supaya tidak masuk data
+   latih dengan label tebakan.
+5. Salah klik → **Batalkan tinjauan**, baris kembali ke antrean.
+
+**Yang penting soal bagaimana ini disimpan:**
+
+| kolom | isi |
+|---|---|
+| `plate_text` | yang dibaca OCR — **tidak pernah ditimpa oleh koreksi** |
+| `corrected_text` | yang dikatakan manusia; `NULL` = belum ditinjau, `""` = tidak terbaca |
+| `reviewed_at` / `reviewed_by` | kapan dan oleh siapa |
+
+Koreksi disimpan **terpisah**, bukan menimpa `plate_text`. Kalau ditimpa, tabel
+akan terlihat lebih rapi sementara satu-satunya hal yang berharga hilang: pasang
+(prediksi, kebenaran). Tanpa pasangan itu tidak ada cara mengukur seberapa
+sering pembacanya salah, salah di karakter apa, atau membandingkan pembaca lama
+dengan pembaca baru.
+
+> **Baris yang sudah ditinjau kebal retensi.** `RETENTION_DAYS` (default 7) tidak
+> menyentuhnya. Tanpa pengecualian ini, dua minggu kerja pelabelan akan lenyap
+> sendiri — diam-diam.
+
+**Membaca hasilnya.** Filter **OCR salah** adalah *error set*: setiap pembacaan
+yang meleset, bersebelahan dengan gambar yang membuatnya meleset. Itu daftar
+yang layak dipelajari.
+
+### Halaman Akurasi OCR
+
+Menu **Akurasi OCR** adalah paruh kedua dari loop ini: tempat tumpukan tinjauan
+berubah jadi angka dan jadi dataset. Tidak perlu shell — orang yang meninjau
+plat biasanya bukan orang yang punya akses terminal ke mesinnya.
+
+**Yang ditampilkan:**
+
+- **Cakupan tinjauan** — sudah berapa dari total pembacaan, dengan tautan
+  langsung ke antrean yang belum diperiksa.
+- **Tiga angka pokok** — terbaca persis, character error rate, dan berapa yang
+  tidak terbaca sama sekali. Di bawah ~100 tinjauan halaman ini **mengatakan
+  sendiri** bahwa angkanya belum stabil, alih-alih menyajikan dua angka di
+  belakang koma yang tidak bisa menopang keputusan apa pun.
+- **Karakter yang paling sering tertukar** — `8 → B`, `0 → O`, `2 → Z`. Dihitung
+  hanya dari salah-baca berpanjang sama, di mana pasangannya tidak ambigu.
+  Inilah daftar yang seharusnya jadi dasar `alpr._CONFUSIONS` — terukur, bukan
+  ditebak.
+- **Per kamera, terburuk di atas.** Ini yang paling bisa langsung
+  ditindaklanjuti: pembaca yang buruk jarang buruk merata, biasanya satu kamera
+  yang terlalu tinggi atau menghadap matahari sore. Masalah tangga, bukan
+  masalah model.
+- **Tombol ekspor** — satu `.zip` berisi crop + label, siap dipakai melatih atau
+  menguji recognizer lain.
+
+Isi zip-nya:
+
+| berkas | isi |
+|---|---|
+| `labels.csv` | `path,label` — bentuk yang dibaca kebanyakan script training |
+| `labels.jsonl` | baris yang sama plus prediksi OCR, confidence, source, waktu, peninjau |
+| `train/`, `eval/` | crop platnya, dipisah **per plat** (lihat di bawah) |
+| `README.txt` | keterangan isi, untuk yang membukanya sebulan kemudian |
+
+Pemisahan train/eval dilakukan **per plat, bukan per baris**: beberapa pembacaan
+satu mobil memakai plat yang sama, dan membiarkannya terbelah antara train dan
+eval membocorkan jawaban ke set eval — setiap skor sesudahnya jadi terlalu bagus,
+tanpa ada yang kelihatan salah.
+
+**Lewat CLI** (untuk cron, build step, atau menulis langsung ke direktori
+training tanpa lewat browser):
+
+```bash
+cd backend
+.venv/Scripts/python ../scripts/export_plate_dataset.py
+.venv/Scripts/python ../scripts/export_plate_dataset.py --out ../data/dataset
+```
+
+Keduanya memakai aritmetika yang sama (`app/plate_dataset.py`), jadi halaman dan
+CLI tidak mungkin menyebut angka akurasi yang berbeda untuk baris yang sama.
+
+```
+  reads scored          412
+  exact match           281 (68.2%)
+  character error rate  7.4%  (243 edits over 3284 chars)
+  most confused         8->B x31   0->O x24   2->Z x11
+```
+
+### Memasang recognizer hasil latih 🔁
+
+Di sinilah loop-nya menutup. Sampai langkah ini, koreksi Anda **tidak**
+memperbaiki pembacaan berikutnya — `corrected_text` hanya dibaca oleh halaman
+akurasi dan oleh export. Tidak ada satu pun jalur di `worker.py` yang
+menyentuhnya, dan itu memang disengaja (lihat komentar di `worker.py`). Koreksi
+adalah *bahan*, bukan umpan balik otomatis.
+
+Ada dua cara bahan itu jadi akurasi, dan urutannya penting.
+
+**1. Tabel perbaikan karakter — murah, tanpa training.** Ambil pasangan teratas
+dari **Karakter yang paling sering tertukar** dan bandingkan dengan `_DIGIT_FIX`
+/ `_ALPHA_FIX` di `app/detection/alpr.py`. Restart, selesai. Tapi tabel ini
+punya batas keras: ia hanya boleh memuat tabrakan bentuk yang **tidak ambigu**.
+`4` yang terbaca `L` tidak bisa masuk — `L` juga bentuk salah-baca `1`, jadi
+memetakannya salah separuh waktu.
+
+**2. Recognizer khusus — satu-satunya yang bisa menembus batas itu.** Model yang
+dilatih pada plat Anda sendiri memutuskan `4` lawan `1` lewat prior font dan
+posisi digit yang ada *di dalam* modelnya, bukan lewat tabel.
+
+Latih di luar aplikasi (EasyOCR menerima arsitektur kustom; `labels.csv` +
+`train/`/`eval/` dari export sudah dalam bentuk yang dibaca sebagian besar
+script training). Hasilnya **tiga file yang namanya sama**:
+
+| berkas | isi | default letaknya |
+|---|---|---|
+| `<nama>.pth` | bobotnya | `OCR_MODEL_DIR` → `data/weights/ocr/` |
+| `<nama>.yaml` | `imgH`, `lang_list`, `character_list`, parameter jaringan | `OCR_NETWORK_DIR` → sama dengan di atas |
+| `<nama>.py` | arsitekturnya | idem |
+
+Taruh ketiganya di `data/weights/ocr/`, lalu di `.env`:
+
+```bash
+OCR_RECOG_NETWORK=plate_id_v1
+```
+
+Restart. Log akan menulis `[ALPR] recogniser: plate_id_v1` kalau berhasil.
+
+**Kalau ada yang kurang, ANPR tidak ikut mati.** EasyOCR berhenti keras di file
+pertama yang tidak bisa dibuka, dan karena `ALPR.__init__` menangkap kegagalan
+init sebagai "OCR tidak tersedia", satu salah ketik di `OCR_RECOG_NETWORK` akan
+mematikan pembacaan plat seluruhnya. Jadi ketiga file diperiksa lebih dulu
+(`alpr.recogniser_kwargs`) dan yang hilang **dilaporkan sekaligus** — biasanya
+yang tertinggal adalah `.py`, dan melaporkannya satu per satu berarti tiga kali
+restart:
+
+```
+[ALPR] custom recogniser 'plate_id_v1' not loaded, missing:
+  data/weights/ocr/plate_id_v1.yaml, data/weights/ocr/plate_id_v1.py
+  -- reading with the stock network instead.
+```
+
+Salah ketik seharusnya menelan akurasi sehari, bukan ANPR. Kalau modelnya gagal
+dimuat saat runtime (yaml rusak, atau `lang_list` di dalamnya tidak mencakup
+`OCR_LANGUAGES`), fallback-nya juga ke jaringan bawaan — bukan ke mati.
+
+> **Catatan soal angkanya.** Setelah mengganti recognizer, skor di halaman
+> Akurasi OCR diukur terhadap pembaca yang **baru**. Tinjauan lama tetap sah
+> sebagai ground truth — yang berubah adalah `plate_text` pada pembacaan baru,
+> bukan `corrected_text` pada yang lama. Bandingkan CER sebelum dan sesudah pada
+> rentang tanggal yang sama.
 
 ### Kenapa `FFMPEG_HWACCEL` tetap `auto`, bukan `cuda`
 
@@ -990,6 +1309,52 @@ Mengecek dan mengelola:
 Get-Content data\logs\backend.log -Tail 50 -Wait
 ```
 
+### Restart setelah mengubah kode ⚠️
+
+```powershell
+# PowerShell as administrator
+cd C:\Dev\cctv-forall
+.\scripts\restart_windows.ps1
+```
+
+**Jangan** pakai `Stop-ScheduledTask` lalu `Start-ScheduledTask` begitu saja. Itu
+terlihat seperti restart, tapi bukan:
+
+`Stop-ScheduledTask` mematikan supervisor PowerShell yang dijalankan task, tapi
+uvicorn dan worker deteksi di bawahnya **jadi yatim, bukan mati** — tetap jalan,
+tetap memegang port. Task lalu menjalankan supervisor baru yang uvicorn-nya
+gagal bind, exit 1, diulang beberapa kali, lalu menyerah:
+
+```
+[service] uvicorn exited with 1 after 3s
+[service] restarting in 5s
+...
+[service] 5 restarts within 5 min; giving up so the Task Scheduler can retry
+```
+
+Hasil akhirnya adalah yang paling menyesatkan: **build lama tetap melayani
+dengan tenang**, tiap perintah melaporkan sukses, dan kode baru Anda tidak
+pernah jalan. Kalau curiga sedang mengalami ini, tanyakan pada servernya sendiri
+alih-alih pada Task Scheduler — endpoint yang hanya ada di kode baru:
+
+```powershell
+curl http://localhost:8000/api/dataset    # 404 = masih kode lama
+```
+
+`restart_windows.ps1` melakukan urutan yang benar: stop task → bunuh sisa
+process tree yang masih memegang port (menelusuri **ke atas** dulu; proses yang
+listen itu cucu dari `uvicorn.exe`, membunuhnya saja meninggalkan sisanya) →
+tunggu portnya benar-benar bebas → aktifkan lagi task kalau crash-loop
+sebelumnya sempat men-disable-nya → start → tunggu sampai benar-benar melayani.
+
+Butuh **PowerShell administrator**: task terdaftar dengan `RunLevel Highest`,
+jadi proses backend-nya elevated dan shell biasa dapat "Access is denied" untuk
+semuanya. Script-nya memeriksa ini di awal dan menolak jalan — gagal di langkah
+2 dari 5 dengan separuh backend mati lebih buruk daripada menolak di langkah 0.
+
+Setelah frontend di-build ulang, **hard-refresh browser** (Ctrl+Shift+R): nama
+bundle-nya berubah tapi `index.html` bisa ke-cache.
+
 ### Mematikan sementara (tanpa menghapus task)
 
 Kadang autostart-nya perlu dimatikan dulu: ada demo di port yang sama, driver
@@ -1136,12 +1501,17 @@ memang bisa berhasil.
 | `PLATE_IMGSZ` | 320 | resolusi detektor plat (jalan di crop kendaraan, bukan frame penuh) |
 | `PLATE_CONF_THRESHOLD` | 0.25 | ambang confidence detektor plat |
 | `PLATE_MIN_CONFIDENCE` | 0.20 | ambang confidence OCR; di bawah ini plat tidak disimpan |
+| `OCR_RECOG_NETWORK` | *(kosong)* | recognizer hasil fine-tune; kosong = CRNN latin bawaan EasyOCR |
+| `OCR_MODEL_DIR` | `data/weights/ocr` | letak `<nama>.pth` |
+| `OCR_NETWORK_DIR` | *(= `OCR_MODEL_DIR`)* | letak `<nama>.yaml` dan `<nama>.py` |
 | `ALPR_MAX_ATTEMPTS` | 12 | berapa frame satu kendaraan dikejar sebelum menyerah |
 | `ALPR_ATTEMPT_INTERVAL` | 3 | jalankan OCR tiap N percobaan (1 = tiap frame deteksi) |
+| `ALPR_READ_ALL_ATTEMPTS` | true | habiskan jatah percobaan supaya semua pembacaan ikut voting; `false` = berhenti di pembacaan pertama yang meyakinkan (lebih hemat antrean OCR) |
 | `ALPR_CLASSES` | `car,truck,bus` | kelas yang platnya dibaca; motor sengaja tidak termasuk |
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
 | `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, terbaca/dikenali atau tidak; `motorcycle,person` |
 | `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
+| `ALPR_CAPTURE_READ_ATTEMPTS` | 8 | berapa frame plat sebuah capture boleh dicoba baca ulang; hanya saat antrean OCR kosong, 0 = satu tembakan seperti dulu |
 | `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum **dibaca** |
 | `ALPR_CAPTURE_CONTAINMENT` | 0.99 | bagian kendaraan yang harus di dalam zona sebelum **di-capture** — 0.99 ≈ utuh, sisakan 1 px goyangan deteksi |
 | `ALPR_CAPTURE_DEDUPE_SECONDS` | 3.0 | berapa lama sebuah capture diingat untuk dibandingkan dengan capture berikutnya (0 = matikan) |
@@ -1164,6 +1534,9 @@ memang bisa berhasil.
 cd backend
 PYTHONPATH=. python tests/test_line_counter.py
 PYTHONPATH=. python tests/test_runtime_tuning.py   # helper tuning performa
+PYTHONPATH=. python tests/test_plate_vote.py       # voting plat antar-frame
+PYTHONPATH=. python tests/test_plate_review.py     # koreksi manual + retensi
+PYTHONPATH=. python tests/test_plate_dataset.py    # skor akurasi, export & split
 ```
 
 ## Catatan performa & akurasi
@@ -1176,6 +1549,8 @@ PYTHONPATH=. python tests/test_runtime_tuning.py   # helper tuning performa
   set `PROCESS_WIDTH` → turunkan `INFERENCE_IMGSZ` → model lebih kecil.
 - **Akurasi ANPR** bergantung resolusi/sudut/pencahayaan CCTV; hasil disimpan
   beserta nilai confidence. ANPR bisa dimatikan per source untuk menghemat CPU.
+  Angka akurasi yang sebenarnya untuk kamera Anda hanya bisa didapat dengan
+  meninjau sebagian hasilnya — lihat *Meninjau & mengoreksi hasil baca*.
 - **Face recognition (YuNet + SFace)** ringan tapi akurasinya bukan kelas
   InsightFace/ArcFace; paling baik untuk wajah frontal & jelas. Enrol beberapa
   foto per orang untuk hasil lebih stabil. Cocokkan `FACE_SIMILARITY_THRESHOLD`

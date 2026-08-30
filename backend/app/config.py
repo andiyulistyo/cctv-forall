@@ -154,6 +154,23 @@ class Settings(BaseSettings):
     # legible (see .env.nvidia.example).
     alpr_max_attempts: int = 12
     alpr_attempt_interval: int = 3
+    # Whether to spend the whole attempt budget on every vehicle, or stop as
+    # soon as one frame reads it confidently.
+    #
+    # Spending it is the default, because the attempts are not repeats -- they
+    # are votes. OCR confidence says how cleanly the decoder resolved one
+    # image; it says nothing about whether the string is the plate. Eight
+    # frames reading "B1234XYZ" at 0.70 against one reading "B1234XY2" at 0.72
+    # is not a contest the 0.72 should win, and stopping early is what used to
+    # hand it the win. Every reading now goes into a per-character vote
+    # (app/detection/plate_vote.py) and the consensus is what gets stored.
+    #
+    # The cost is real and worth knowing: the OCR queue is eight deep and drops
+    # what it cannot keep up with, so a vehicle that keeps reading keeps taking
+    # slots. On a camera busy enough that crops are being dropped, turning this
+    # off buys back the budget for vehicles that have not been read at all --
+    # a first read of the next car is worth more than a ninth of this one.
+    alpr_read_all_attempts: bool = True
     # Which tracked classes are worth reading a plate from.
     #
     # Motorcycles are left out by default, and not for lack of interest: an
@@ -195,6 +212,21 @@ class Settings(BaseSettings):
     # capturing nothing. A capture only has to show the vehicle, so the floor
     # is much lower. 0 disables it.
     alpr_capture_min_width: int = 48
+    # How many frames a captured vehicle may be re-read on, after the capture
+    # itself has been recorded.
+    #
+    # A capture used to get exactly one shot at OCR -- taken as the row was
+    # written, and only if the queue happened to be idle at that instant. One
+    # frame of a moving motorcycle is a coin toss: the plate is angled, or
+    # motion-blurred, or half behind the rider's leg, and there was no second
+    # chance and nothing to vote with. That is most of why motorcycles read so
+    # much worse than cars, and it has nothing to do with their plates.
+    #
+    # These attempts stay strictly subordinate: one is only queued while the
+    # OCR queue is completely idle, so a busy junction still spends its whole
+    # budget on ALPR_CLASSES exactly as before. Set to 0 to restore the old
+    # one-shot behaviour.
+    alpr_capture_read_attempts: int = 8
     # How much of a vehicle's box must fall inside the ANPR zone before it
     # counts as being in there, as a fraction of the box's own area.
     #
@@ -335,8 +367,30 @@ class Settings(BaseSettings):
     # a motorcycle crop can be 569 px wide while the plate inside it is 60 px
     # across. Enlarging under 1.5x is skipped outright -- interpolation softens
     # every edge, and a marginal resize costs more sharpness than it buys.
-    ocr_min_height: int = 64
-    ocr_min_width: int = 240
+    #
+    # Raised from 64/240 after measuring, on 94 reviewed reads replayed from
+    # their saved frames through the real ladder. At 64/240 the *typical* plate
+    # from these cameras was never enlarged at all: a 172x74 crop asks for
+    # 240/172 = 1.40x, which falls under the 1.5x floor and is returned
+    # untouched, and 57% of the reviewed crops landed in that gap. Half of all
+    # reads were coming back with fewer characters than the plate has -- not
+    # misread, unseen.
+    #
+    #   min_h/min_w    64/240  128/480  160/600  192/720  224/840  256/960
+    #   exact match     16.3%    18.6%    23.3%    19.8%    14.0%    10.5%
+    #   short reads        36       23       25       30       35       34
+    #
+    # A clean inverted U with the peak here: past ~600 px interpolation starts
+    # inventing detail rather than revealing it and the reads get worse than
+    # doing nothing. Note the width term is what binds on a plate-shaped crop
+    # (600/w exceeds 160/h for anything wider than it is tall), so this really
+    # says "show OCR a plate about 600 px across" and lands in the same place
+    # whether the crop arrived at 172 px or 226 px wide.
+    #
+    # Worth re-measuring as reviews accumulate: at 86 scorable reads the +9/-3
+    # swing behind that peak is suggestive rather than settled.
+    ocr_min_height: int = 160
+    ocr_min_width: int = 600
     # Confidence at which OCR stops trying further preprocessings of the same
     # crop. Matches ALPR_* good-enough handling in the worker: a read that
     # stops the vehicle being retried has nothing to gain from more variants.
@@ -346,6 +400,33 @@ class Settings(BaseSettings):
     # preprocessing costs other vehicles their turn. Raise it only if plates
     # are being missed *and* the queue is not backing up.
     ocr_max_passes: int = 8
+
+    # --- Custom plate recogniser (optional) ---
+    # The recogniser EasyOCR runs. Empty means its stock latin CRNN, which is
+    # what every number on the Akurasi OCR page is currently measured against.
+    # Point this at a network fine-tuned on the exported dataset and the review
+    # loop finally closes: corrections become training data, training data
+    # becomes a recogniser, and the recogniser reads the next plate.
+    #
+    # This is the only way to reach the failures a repair table cannot. The
+    # "4" read as "L" documented in the README is the example -- L is also how
+    # a misread 1 looks, so no character mapping can decide between them, while
+    # a model carrying plate-font and digit-position priors can.
+    #
+    # EasyOCR loads a custom recogniser from three files sharing this name, and
+    # raises if any one of them is absent:
+    #   <ocr_network_dir>/<name>.yaml   imgH, lang_list, character_list, params
+    #   <ocr_network_dir>/<name>.py     the architecture
+    #   <ocr_model_dir>/<name>.pth      the weights
+    # "standard", "english_g2" and "latin_g2" are EasyOCR's own and need none
+    # of them. A name whose files are missing logs and falls back to stock --
+    # see alpr.recogniser_kwargs for why that is not treated as an error.
+    ocr_recog_network: str = ""
+    # Where the .pth lives. Empty => data/weights/ocr.
+    ocr_model_dir: str = ""
+    # Where the .yaml and .py live. Empty => wherever the weights are, which is
+    # how a downloaded fine-tune normally arrives: one folder, three files.
+    ocr_network_dir: str = ""
 
     # --- Face recognition (OpenCV YuNet + SFace) ---
     face_enabled: bool = True
@@ -470,6 +551,44 @@ class Settings(BaseSettings):
             if resolved.exists():
                 return str(resolved)
         return raw  # ultralytics will try to download it by name
+
+    def _resolve_dir(self, raw: str) -> Path | None:
+        """A configured directory, found the way the model paths are found.
+
+        Same bases and the same reason: the .env examples write these relative
+        to the repo root, and the app is started from either the root or from
+        backend/. Returns None when nothing is configured; an unresolvable name
+        comes back rooted at the project root, so the "missing file" message it
+        eventually produces names a path somebody can go and look at rather
+        than one relative to whatever directory the service happened to start
+        in.
+        """
+        if not raw:
+            return None
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            return candidate
+        for base in (Path.cwd(), BASE_DIR.parent, self.data_dir):
+            resolved = base / candidate
+            if resolved.is_dir():
+                return resolved
+        return BASE_DIR.parent / candidate
+
+    @property
+    def ocr_model_dir_path(self) -> Path:
+        """Where a custom recogniser's ``.pth`` is looked for."""
+        return self._resolve_dir(self.ocr_model_dir) or (self.weights_dir / "ocr")
+
+    @property
+    def ocr_network_dir_path(self) -> Path:
+        """Where a custom recogniser's ``.yaml`` and ``.py`` are looked for.
+
+        Defaults to the weights directory rather than to EasyOCR's own
+        user_network location: a fine-tune is normally handed over as one
+        folder holding all three files, and making the common case need two
+        settings instead of one buys nothing.
+        """
+        return self._resolve_dir(self.ocr_network_dir) or self.ocr_model_dir_path
 
     @property
     def yunet_model_path(self) -> str:

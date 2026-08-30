@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import re
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -211,6 +213,13 @@ def _upscale(gray: np.ndarray, min_height: int, min_width: int, cap: float = 6.0
     # edge it touches, and under 1.5x it buys too few pixels to pay that back.
     # Measured -- resizing sample 3 by the 1.2x its width asked for was enough
     # on its own to lose the read the untouched crop gives up.
+    #
+    # This floor used to swallow the common case rather than the marginal one.
+    # Against the old 64/240 targets a 172x74 plate -- the median crop off
+    # these cameras -- asked for 1.40x and was handed back untouched, and 57%
+    # of reviewed crops fell in that gap; the settings now ask for enough that
+    # a genuine plate clears the floor and only an already-large crop is left
+    # alone. See settings.ocr_min_width for the measurement behind the targets.
     if scale < 1.5:
         return gray
     return cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -252,6 +261,46 @@ def _sharpen(gray: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(equalized, 1.7, blurred, -0.7, 0)
 
 
+# Recogniser names EasyOCR ships and fetches itself. They take no directories
+# and no local files, so they are never checked for on disk.
+_STOCK_NETWORKS = frozenset({"standard", "english_g2", "latin_g2"})
+
+
+def recogniser_kwargs(
+    name: str, model_dir: str, network_dir: str
+) -> tuple[dict, list[str]]:
+    """EasyOCR arguments for a custom recogniser, and any files it is missing.
+
+    Returns ``(kwargs, missing)``. The second half is the point of doing this
+    here rather than letting ``easyocr.Reader`` raise: EasyOCR stops at the
+    first absent file with a message about that one path, while a fine-tune
+    arrives as three files and it is usually the ``.py`` that did not get
+    copied. Reporting all of them at once turns three restarts into one.
+
+    A missing file is deliberately *not* an error to the caller. Plate reading
+    that refuses to start is a worse outcome than plate reading that runs the
+    stock network for another day -- a mistyped name should cost accuracy, not
+    ANPR -- so the caller logs ``missing`` and carries on with ``{}``. This is
+    the same trade ``settings.plate_model_path`` makes, with the difference
+    that here the fallback is announced rather than silent.
+    """
+    if not name or name == "standard":
+        return {}, []
+    if name in _STOCK_NETWORKS:
+        # EasyOCR downloads these on demand; the directories would be ignored.
+        return {"recog_network": name}, []
+
+    models = Path(model_dir)
+    nets = Path(network_dir or model_dir)
+    required = [nets / f"{name}.yaml", nets / f"{name}.py", models / f"{name}.pth"]
+    kwargs = {
+        "recog_network": name,
+        "model_storage_directory": str(models),
+        "user_network_directory": str(nets),
+    }
+    return kwargs, [str(p) for p in required if not p.is_file()]
+
+
 class ALPR:
     def __init__(
         self,
@@ -262,10 +311,13 @@ class ALPR:
         plate_conf: float = 0.25,
         min_confidence: float = 0.20,
         half: bool = False,
-        ocr_min_height: int = 64,
-        ocr_min_width: int = 240,
+        ocr_min_height: int = 160,
+        ocr_min_width: int = 600,
         good_enough: float = 0.75,
         max_passes: int = 8,
+        recog_network: str = "",
+        model_dir: str = "",
+        network_dir: str = "",
     ):
         self._reader = None
         self._plate_detector = None
@@ -291,6 +343,11 @@ class ALPR:
         self.max_passes = max_passes
         # fp16 is a GPU-only win, exactly as for the vehicle detector.
         self.half = bool(half) and self.device != "cpu"
+        # Which recogniser actually ended up loaded. Worth keeping rather than
+        # assuming the configured one: every fallback below is a case where the
+        # reader running is not the reader asked for, and an accuracy figure
+        # means something different depending on which of them produced it.
+        self.recog_network = "standard"
         try:
             import easyocr
 
@@ -299,15 +356,43 @@ class ALPR:
             # Passing the string keeps us in control (e.g. "mps" on Apple
             # Silicon) instead of relying on its own auto-detection.
             gpu_arg = False if self.device == "cpu" else self.device
+
+            kwargs, missing = recogniser_kwargs(recog_network, model_dir, network_dir)
+            if missing:
+                print(
+                    f"[ALPR] custom recogniser {recog_network!r} not loaded, missing: "
+                    + ", ".join(missing)
+                    + " -- reading with the stock network instead."
+                )
+                kwargs = {}
+            self.recog_network = kwargs.get("recog_network", "standard")
+
             try:
-                self._reader = easyocr.Reader(langs, gpu=gpu_arg, verbose=False)
+                self._reader = easyocr.Reader(langs, gpu=gpu_arg, verbose=False, **kwargs)
             except Exception as exc:
-                # Some EasyOCR builds choke on non-CUDA accelerators; the CPU
-                # path always works and OCR is only run on small plate crops.
+                # Two different things fail here and they want different
+                # answers: the accelerator (some EasyOCR builds choke on
+                # non-CUDA devices) and the custom recogniser (a malformed
+                # yaml, or a lang_list in it that does not cover OCR_LANGUAGES).
+                # Drop the device first and keep the fine-tune -- it is the
+                # whole reason anyone configured one, so it is given up only
+                # once it is demonstrably the broken half.
                 print(f"[ALPR] {self.device} unavailable ({exc}); falling back to CPU")
                 self.device = "cpu"
-                self._reader = easyocr.Reader(langs, gpu=False, verbose=False)
+                try:
+                    self._reader = easyocr.Reader(langs, gpu=False, verbose=False, **kwargs)
+                except Exception as exc2:
+                    if not kwargs:
+                        raise
+                    print(
+                        f"[ALPR] custom recogniser {self.recog_network!r} failed to "
+                        f"load ({exc2}); reading with the stock network instead."
+                    )
+                    self.recog_network = "standard"
+                    self._reader = easyocr.Reader(langs, gpu=False, verbose=False)
             self._available = True
+            if self.recog_network != "standard":
+                print(f"[ALPR] recogniser: {self.recog_network}")
         except Exception as exc:  # pragma: no cover - environment dependent
             print(f"[ALPR] disabled: could not init EasyOCR: {exc}")
             self._available = False
@@ -357,6 +442,27 @@ class ALPR:
             if roi.size:
                 return roi
         return None
+
+    def locate_plate(self, vehicle_crop: np.ndarray) -> np.ndarray | None:
+        """Where the plate is, without trying to read it.
+
+        Finding a plate and reading one are different problems, and on a
+        motorcycle they have different answers: the detector puts a tight box
+        on the plate at 0.8 confidence in frames the recogniser then makes
+        nothing of. Everything that happens to a read that fails -- the picture
+        an operator reviews it from, the crop it contributes to a training
+        set -- is better served by that box than by the whole vehicle it was
+        found in, so the caller can ask for it on its own.
+
+        Returns None when no detector is loaded or none was found; the caller
+        keeps whatever it already had.
+        """
+        if vehicle_crop is None or vehicle_crop.size == 0:
+            return None
+        try:
+            return self._detector_roi(vehicle_crop)
+        except Exception:
+            return None
 
     def _plate_rois(self, vehicle_crop: np.ndarray) -> list[np.ndarray]:
         """Regions that might hold the plate, best guess first.

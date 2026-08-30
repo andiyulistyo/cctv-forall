@@ -537,6 +537,9 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             ocr_min_width=settings.ocr_min_width,
             good_enough=settings.ocr_good_enough,
             max_passes=settings.ocr_max_passes,
+            recog_network=settings.ocr_recog_network,
+            model_dir=str(settings.ocr_model_dir_path),
+            network_dir=str(settings.ocr_network_dir_path),
         )
         if not alpr.available:
             alpr = None
@@ -613,10 +616,12 @@ def run_worker(source_cfg: dict, shared: SharedState, stop_event, slot: int = 0)
             source_id,
             max_attempts=settings.alpr_max_attempts,
             attempt_interval=settings.alpr_attempt_interval,
+            read_all_attempts=settings.alpr_read_all_attempts,
             classes=_alpr_classes(settings.alpr_classes),
             min_vehicle_width=settings.alpr_min_vehicle_width,
             capture_classes=_capture_classes(settings.alpr_capture_classes),
             capture_min_width=settings.alpr_capture_min_width,
+            capture_read_attempts=settings.alpr_capture_read_attempts,
             zone=source_cfg.get("alpr_zone"),
             zone_min_overlap=settings.alpr_zone_min_overlap,
             capture_containment=settings.alpr_capture_containment,
@@ -915,10 +920,12 @@ class _PlateReader:
         source_id: int,
         max_attempts: int = 12,
         attempt_interval: int = 3,
+        read_all_attempts: bool = True,
         classes: tuple[str, ...] = VEHICLE_CLASSES,
         min_vehicle_width: int = 0,
         capture_classes: tuple[str, ...] = (),
         capture_min_width: int = 0,
+        capture_read_attempts: int = 8,
         zone: dict | None = None,
         zone_min_overlap: float = 0.5,
         capture_containment: float = 0.99,
@@ -934,6 +941,15 @@ class _PlateReader:
         self._source_id = source_id
         self._max_attempts = max_attempts
         self._attempt_interval = max(1, attempt_interval)
+        # Whether a vehicle keeps being read after one frame came back
+        # confident. It does, by default: every reading is a vote, and a string
+        # agreed on by eight frames is worth more than the one frame that
+        # happened to score highest (see ``plate_vote``). Turning this off
+        # restores the older, cheaper behaviour -- stop at the first good read
+        # and spend the queue on the next vehicle -- which is the right trade
+        # on a camera busy enough that crops are being dropped for want of a
+        # slot.
+        self._read_all_attempts = read_all_attempts
         self._classes = classes
         self._min_vehicle_width = max(0, min_vehicle_width)
         self._zone = zone or None
@@ -948,6 +964,9 @@ class _PlateReader:
             )
             self._capture_classes = ()
         self._capture_min_width = max(0, capture_min_width)
+        # Frames a captured vehicle may be re-read on once its row exists. See
+        # _maybe_reread and app.config for why one shot was never enough.
+        self._capture_read_attempts = max(0, capture_read_attempts)
         self._zone_min_overlap = min(1.0, max(0.0, zone_min_overlap))
         # Captures are judged on a stricter reading of the same zone than plate
         # reads are. A read wants the earliest frame the plate is legible in and
@@ -1023,8 +1042,9 @@ class _PlateReader:
                 continue
             if capturable and not readable:
                 self._maybe_capture(vehicle, det, frame, (x1, y1, x2, y2), now, faces)
+                self._maybe_reread(vehicle, det, frame, (x1, y1, x2, y2), now)
                 continue
-            if vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
+            if not self._read_all_attempts and vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
                 continue  # already read well; spend the budget elsewhere
             attempts = vehicle.attempts
             if attempts >= self._max_attempts:
@@ -1072,6 +1092,62 @@ class _PlateReader:
         # renumbered car keeps the plate already read from it on screen.
         self.plates = self._vehicles.labels()
         self._vehicles.prune(now)
+
+    def _maybe_reread(self, vehicle, det, frame, box, now: float) -> None:
+        """Offer another look at a captured vehicle's plate, if nothing else wants the queue.
+
+        A capture is a record of a passage and is complete without a plate, so
+        this can never be allowed to cost a read from ALPR_CLASSES -- that
+        trade was measured and lost once already (motorcycles were 77% of the
+        traffic and produced no reads while taking 77% of the budget). Hence
+        the idle-queue test: these attempts run on capacity that would
+        otherwise go unused, and the moment a car needs the queue they stop.
+
+        What they buy is the thing a single attempt cannot have -- a second
+        opinion. One frame of a moving motorcycle is a coin toss: angled,
+        motion-blurred, or half behind the rider's leg. Several frames go into
+        the same per-character vote as any other vehicle's (see ``plate_vote``)
+        and correct the row the capture already wrote, through ``row_id``.
+        """
+        if self._capture_read_attempts <= 0:
+            return
+        # Nothing to correct yet: the capture has not been written, so there is
+        # no row for a read to improve and no vehicle worth spending OCR on.
+        if not vehicle.captured or vehicle.row_id is None:
+            return
+        if vehicle.votes.confidence >= _PLATE_GOOD_ENOUGH_CONF:
+            return  # already read well
+        if vehicle.attempts >= self._capture_read_attempts:
+            return
+        # Strictly subordinate. Not _offer(): that evicts a waiting job to make
+        # room, which is exactly the theft this must never commit.
+        if not self._queue.empty():
+            return
+
+        x1, y1, x2, y2 = box
+        if x2 - x1 < self._capture_min_width:
+            return
+        if not self._in_zone(frame, (x1, y1, x2, y2)):
+            return
+        if self._vehicles.is_parked(vehicle, now):
+            return
+
+        attempts = vehicle.attempts
+        vehicle.attempts = attempts + 1
+        if attempts % self._attempt_interval != 0:
+            return
+        if frame[y1:y2, x1:x2].size == 0:
+            return
+        # No snapshot: the capture already wrote the evidence frame for this
+        # passage, and a better read corrects the text on that same row rather
+        # than photographing the moment again.
+        crop = frame[y1:y2, x1:x2].copy()
+        self._offer(
+            vehicle.vid,
+            ("read", vehicle.vid, det.track_id, det.class_name, crop, None,
+             (x1, y1, x2, y2), None),
+            evict=False,
+        )
 
     def _maybe_capture(self, vehicle, det, frame, box, now: float, faces=()) -> None:
         """Record a capture-class vehicle the once it is through the zone.
@@ -1235,19 +1311,10 @@ class _PlateReader:
                 vehicle = self._vehicles.get(vid)
                 if result is not None and vehicle is not None:
                     text, conf, plate_img = result
-                    # Only an improvement replaces what we already have: a
-                    # confident read from close up must not be overwritten by a
-                    # marginal one from the next frame.
-                    if conf > vehicle.best_conf:
-                        vehicle.best_conf = conf
-                        vehicle.text = text
-                        row_id = _persist_plate(
-                            self._source_id, tid, class_name, text, conf, plate_img,
-                            snapshot=snapshot, box=box,
-                            row_id=vehicle.row_id,
-                        )
-                        if row_id is not None:
-                            vehicle.row_id = row_id
+                    self._record_read(
+                        vehicle, tid, class_name, text, conf, plate_img,
+                        snapshot=snapshot, box=box,
+                    )
             except Exception as exc:
                 # A failed read is not worth losing the thread over: the vehicle
                 # keeps its attempt budget and gets another frame. It is worth
@@ -1259,6 +1326,49 @@ class _PlateReader:
                     print(f"[ALPR] plate read failed: {type(exc).__name__}: {exc}")
             finally:
                 self._pending.discard(vid)
+
+    def _record_read(
+        self, vehicle, tid, class_name, text, conf, plate_img,
+        snapshot=None, box=None,
+    ) -> None:
+        """Fold one reading into the vehicle's vote and write out the result.
+
+        Two questions with two different answers, which is why this is no
+        longer a single "is this read better?" test:
+
+        * **What does the plate say?** Every reading of this vehicle, voted on
+          per character. A string agreed by six frames beats the one frame that
+          scored highest on a different string -- exactly the case a plain
+          argmax got wrong. See ``plate_vote``.
+        * **Which picture do we keep?** The single clearest read. A consensus
+          assembled across frames has no image of its own, and the crop that
+          decoded best is the one an operator has the best chance of reading.
+
+        So the text can change without the images changing, and often does:
+        the vote moves on readings that were never the sharpest. Only a
+        genuinely better picture is worth two JPEG writes, so the other case
+        goes through :func:`_update_plate_text` and touches the row alone.
+        """
+        changed = vehicle.votes.add(text, conf)
+        better_image = conf > vehicle.best_conf
+        if not changed and not better_image:
+            return
+        vehicle.text = vehicle.votes.text
+        if better_image:
+            vehicle.best_conf = conf
+            row_id = _persist_plate(
+                self._source_id, tid, class_name,
+                vehicle.votes.text, vehicle.votes.confidence, plate_img,
+                snapshot=snapshot, box=box, row_id=vehicle.row_id,
+            )
+            if row_id is not None:
+                vehicle.row_id = row_id
+        elif vehicle.row_id is not None:
+            # The evidence frame carries the plate drawn on it, and this path
+            # deliberately leaves that alone: it is the label from the moment
+            # that picture was taken, and the vote has moved since. It settles
+            # within a few readings, and the next better crop redraws it.
+            _update_plate_text(vehicle.row_id, vehicle.votes.text, vehicle.votes.confidence)
 
     def _do_capture(self, vid, tid, class_name, crop, snapshot, box, match=None) -> None:
         """Write the capture row, then try for a plate only if nothing is waiting.
@@ -1283,8 +1393,19 @@ class _PlateReader:
         # straight across the edge of what OCR is about to be shown.
         ocr_crop = crop if snapshot is None else crop.copy()
         vehicle = self._vehicles.get(vid)
+        # The picture filed against the row is the plate, not the vehicle,
+        # whenever the detector can find one -- and it usually can, at high
+        # confidence, on the very frames the recogniser then fails to read.
+        # Three things depend on that choice and all three were being served
+        # the wrong image: the "Plat (crop)" column showed a whole motorcycle,
+        # a reviewer had to read a plate off a thumbnail of a bike, and the
+        # exported training set filed its most valuable examples -- the ones
+        # OCR got wrong -- as pictures of vehicles. The whole scene is not
+        # lost; it is the evidence frame, which is what it was always for.
+        located = self._alpr.locate_plate(ocr_crop) if class_name != "person" else None
         row_id = _persist_plate(
-            self._source_id, tid, class_name, "", 0.0, crop,
+            self._source_id, tid, class_name, "", 0.0,
+            located if located is not None else crop,
             snapshot=snapshot, box=box,
             row_id=vehicle.row_id if vehicle is not None else None,
         )
@@ -1299,16 +1420,9 @@ class _PlateReader:
         if result is None:
             return
         text, conf, plate_img = result
-        if conf <= vehicle.best_conf:
-            return
-        vehicle.best_conf = conf
-        vehicle.text = text
-        updated = _persist_plate(
-            self._source_id, tid, class_name, text, conf, plate_img,
-            snapshot=None, box=box, row_id=row_id,
-        )
-        if updated is not None:
-            vehicle.row_id = updated
+        # No snapshot: the capture above has already drawn its box on it and
+        # written it out, and this read corrects the very row it created.
+        self._record_read(vehicle, tid, class_name, text, conf, plate_img, None, box)
 
     def close(self) -> None:
         # Drop the backlog first, so the sentinel always fits.
@@ -1392,6 +1506,31 @@ def _recent_duplicate(db, source_id: int, text: str) -> PlateRead | None:
         .order_by(PlateRead.timestamp.desc())
         .limit(1)
     ).first()
+
+
+def _update_plate_text(row_id: int, text: str, conf: float) -> None:
+    """Correct a row's text in place, leaving its images where they are.
+
+    The cross-frame vote can move on a reading that is not the clearest one,
+    and rewriting the crop and the full frame every time it does would churn
+    two JPEGs to replace a picture that got no better. The row is the only
+    thing that changed, so the row is the only thing written.
+
+    ``corrected_text`` is deliberately untouched: a review is a human's answer
+    to the same question, and it outranks anything OCR arrives at later.
+    """
+    db = SessionLocal()
+    try:
+        row = db.get(PlateRead, row_id)
+        if row is None:
+            return
+        row.plate_text = text
+        row.confidence = conf
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _persist_plate(

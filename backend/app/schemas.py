@@ -138,10 +138,16 @@ class PlateOut(BaseModel):
     source_id: int
     track_id: int
     vehicle_class: str
+    # What OCR read. Never overwritten by a review -- see models.PlateRead.
     plate_text: str
     confidence: float
     has_image: bool
     has_frame: bool
+    # What a person said it really is. None = nobody has looked at it yet;
+    # "" = somebody looked and it is not legible.
+    corrected_text: str | None = None
+    reviewed_at: datetime | None = None
+    reviewed_by: str | None = None
     timestamp: datetime
 
     model_config = {"from_attributes": True}
@@ -149,6 +155,21 @@ class PlateOut(BaseModel):
     @field_serializer("timestamp")
     def _ser_timestamp(self, v: datetime) -> str | None:
         return _as_utc_iso(v)
+
+    @field_serializer("reviewed_at")
+    def _ser_reviewed_at(self, v: datetime | None) -> str | None:
+        return _as_utc_iso(v) if v is not None else None
+
+
+class PlateReviewIn(BaseModel):
+    """One person's answer to "what does this plate actually say?".
+
+    The empty string is a legitimate answer and means "I looked, and it cannot
+    be read" -- which is worth recording, because it is what keeps an
+    unreadable crop out of a training set instead of into it under a guess.
+    """
+
+    plate_text: str = Field("", max_length=30)
 
 
 class PlateListResponse(BaseModel):

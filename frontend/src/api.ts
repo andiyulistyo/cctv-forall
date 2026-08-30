@@ -70,12 +70,51 @@ export interface Plate {
   source_id: number;
   track_id: number;
   vehicle_class: string;
+  /** What OCR read. A review never overwrites this -- see `corrected_text`. */
   plate_text: string;
   confidence: number;
   has_image: boolean;
   /** A full frame of the moment was kept, with the vehicle boxed. */
   has_frame: boolean;
+  /**
+   * What a person said the plate really is.
+   *
+   * `null` -- nobody has looked at this read yet.
+   * `""`   -- somebody looked and the plate cannot be read from the crop.
+   * a string -- the plate, whether or not OCR happened to agree.
+   *
+   * Kept apart from `plate_text` on purpose: the pair (prediction, truth) is
+   * the whole value of a reviewed read, and merging them would leave the
+   * screen looking right while destroying any way to measure the reader.
+   */
+  corrected_text: string | null;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
   timestamp: string;
+}
+
+/** Where a read stands with a human reviewer. Mirrors api/plates.ReviewFilter. */
+export const REVIEW_FILTERS = [
+  "pending",
+  "reviewed",
+  "correct",
+  "wrong",
+  "illegible",
+] as const;
+export type ReviewFilter = (typeof REVIEW_FILTERS)[number];
+
+/** What a row's review says, as one word the UI can badge. */
+export type ReviewState = "pending" | "correct" | "wrong" | "illegible";
+
+export function reviewState(p: Plate): ReviewState {
+  if (p.reviewed_at === null) return "pending";
+  if (p.corrected_text === "") return "illegible";
+  return p.corrected_text === p.plate_text ? "correct" : "wrong";
+}
+
+/** The best answer available for a read: the human's if there is one. */
+export function plateAnswer(p: Plate): string {
+  return p.corrected_text ?? p.plate_text;
 }
 
 export interface PlateListResponse {
@@ -103,6 +142,7 @@ export interface PlateQuery {
   /** Part of the plate text. Spaces and dashes are ignored by the server. */
   q?: string;
   min_confidence?: number;
+  review?: ReviewFilter;
   /** ISO timestamps. Only reads at or after `from`, and at or before `to`. */
   from?: string;
   to?: string;
@@ -138,6 +178,48 @@ export interface Sighting {
   /** A full frame of the moment was kept, with the face boxed. */
   has_frame: boolean;
   timestamp: string;
+}
+
+/** How the reviews have gone, and how much is left. */
+export interface ReviewProgress {
+  total: number;
+  reviewed: number;
+  pending: number;
+  /** Reviewed, legible, and OCR had it right. */
+  correct: number;
+  /** Reviewed, legible, and OCR had it wrong -- the error set. */
+  wrong: number;
+  /** Reviewed and not readable by anyone; excluded from every score below. */
+  illegible: number;
+}
+
+/** How the reader scores against the labels. */
+export interface OcrMetrics {
+  reads: number;
+  exact: number;
+  exact_rate: number;
+  blank: number;
+  blank_rate: number;
+  chars: number;
+  errors: number;
+  /** Character error rate: edits per character of ground truth. */
+  cer: number;
+  confusions: { pair: string; count: number }[];
+}
+
+export interface SourceMetrics extends OcrMetrics {
+  source_id: number;
+  name: string;
+}
+
+export interface DatasetSummary {
+  progress: ReviewProgress;
+  /** null until something has been reviewed -- not a row of zeroes, which
+   *  would read as "the reader gets nothing right". */
+  metrics: OcrMetrics | null;
+  per_source: SourceMetrics[];
+  /** Reviewed reads left out of the scoring, and why. */
+  skipped: { reason: string; count: number }[];
 }
 
 function getToken(): string | null {
@@ -214,6 +296,17 @@ export const api = {
     request<CountsResponse>(`/counts${sourceId ? `?source=${sourceId}` : ""}`),
   listPlates: (query: PlateQuery = {}) =>
     request<PlateListResponse>(`/plates?${plateQueryString(query)}`),
+  /** Record what a person says this plate is. "" means "looked, unreadable". */
+  reviewPlate: (id: number, plateText: string) =>
+    request<Plate>(`/plates/${id}/review`, {
+      method: "PUT",
+      body: JSON.stringify({ plate_text: plateText }),
+    }),
+  /** Undo a review, putting the read back in the pending queue. */
+  unreviewPlate: (id: number) => request<Plate>(`/plates/${id}/review`, { method: "DELETE" }),
+
+  // --- OCR accuracy / dataset ---
+  getDataset: () => request<DatasetSummary>("/dataset"),
 
   // --- Faces ---
   listFaces: () => request<EnrolledFace[]>("/faces"),
@@ -244,6 +337,10 @@ export const api = {
 
   // Media URLs (token via query string for <img>/stream tags)
   streamUrl: (id: number) => `${BASE}/streams/${id}?token=${getToken() ?? ""}`,
+  /** Navigated to directly, so the browser owns the download and its progress
+   *  bar -- hence the token in the query string, as for the images. */
+  datasetExportUrl: (evalShare: number) =>
+    `${BASE}/dataset/export?token=${getToken() ?? ""}&eval_share=${evalShare}`,
   plateImageUrl: (id: number) => `${BASE}/plates/${id}/image?token=${getToken() ?? ""}`,
   plateFrameUrl: (id: number) => `${BASE}/plates/${id}/frame?token=${getToken() ?? ""}`,
   faceImageUrl: (id: number) => `${BASE}/faces/${id}/image?token=${getToken() ?? ""}`,

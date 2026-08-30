@@ -29,7 +29,9 @@ this is a small state machine and is worth being able to test as one.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from .plate_vote import PlateVoter
 
 Box = tuple[float, float, float, float]  # x1, y1, x2, y2
 
@@ -80,7 +82,14 @@ class Vehicle:
     moved_at: float = 0.0
     # --- plate state, carried across renumbering ---
     attempts: int = 0
+    # Best confidence any *single* reading of this vehicle came back with. It
+    # decides which crop and frame are kept, not what the plate says -- the
+    # clearest picture is still the clearest picture even when the vote lands
+    # elsewhere.
     best_conf: float = 0.0
+    # Every reading, and the consensus over them. This, not best_conf, is where
+    # the plate text comes from; see ``plate_vote``.
+    votes: PlateVoter = field(default_factory=PlateVoter)
     text: str = ""
     row_id: int | None = None
     # Already recorded once by the capture path (see ALPR_CAPTURE_CLASSES).

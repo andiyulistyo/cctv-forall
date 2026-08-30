@@ -4,6 +4,7 @@ import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import SourceDetail from "./pages/SourceDetail";
 import Plates from "./pages/Plates";
+import Dataset from "./pages/Dataset";
 import Faces from "./pages/Faces";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
@@ -23,6 +24,9 @@ function NavBar() {
       </Link>
       <Link className="hover:text-sky-300" to="/plates">
         Plat Nomor
+      </Link>
+      <Link className="hover:text-sky-300" to="/accuracy">
+        Akurasi OCR
       </Link>
       <Link className="hover:text-sky-300" to="/faces">
         Wajah
@@ -76,6 +80,16 @@ export default function App() {
           <RequireAuth>
             <Shell>
               <Plates />
+            </Shell>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/accuracy"
+        element={
+          <RequireAuth>
+            <Shell>
+              <Dataset />
             </Shell>
           </RequireAuth>
         }

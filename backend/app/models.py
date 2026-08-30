@@ -127,6 +127,22 @@ class PlateRead(Base):
     vehicle_class: Mapped[str] = mapped_column(String(30))
     plate_text: Mapped[str] = mapped_column(String(30), index=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    # --- human review -------------------------------------------------
+    # What a person says this plate actually is. Deliberately a *separate*
+    # column rather than an edit of plate_text: the pair (what OCR said, what
+    # it really was) is the entire value of a reviewed read. Overwrite
+    # plate_text with the correction and the row still looks right in the
+    # listing while the measurement -- how often is the reader wrong, and wrong
+    # how -- is destroyed, along with any chance of using these rows to train
+    # or compare a recogniser. plate_text stays the prediction, forever.
+    #
+    # NULL means nobody has looked. An empty string means somebody looked and
+    # could not read the plate either, which is a real and useful answer: it
+    # keeps an illegible crop out of a training set instead of labelling it
+    # with a guess. The two are told apart by reviewed_at, not by the text.
+    corrected_text: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
     image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Full frame at the moment of the read, with the vehicle boxed. The plate
     # crop alone proves the characters but not what they were attached to; this

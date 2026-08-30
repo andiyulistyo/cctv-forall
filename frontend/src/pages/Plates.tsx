@@ -6,10 +6,13 @@ import {
   Plate,
   PLATE_SORT_KEYS,
   PlateSortKey,
+  ReviewFilter,
+  REVIEW_FILTERS,
   Source,
   VEHICLE_CLASSES,
+  plateAnswer,
 } from "../api";
-import { PlateEvidenceModal } from "../components/common";
+import { PlateEvidenceModal, ReviewBadge } from "../components/common";
 
 const PAGE_SIZE = 15;
 
@@ -30,6 +33,19 @@ const RANGES = [
   { key: "7d", label: "7 hari terakhir", ms: 604_800_000 },
 ];
 
+// Reviewing is a queue, so the filter that runs it is "pending". The rest are
+// there for reading the result back: "wrong" is the error set -- every read the
+// recogniser got wrong, next to the picture it got it wrong from -- and it is
+// the list worth actually studying.
+const REVIEWS: { key: "" | ReviewFilter; label: string }[] = [
+  { key: "", label: "Semua tinjauan" },
+  { key: "pending", label: "Belum ditinjau" },
+  { key: "reviewed", label: "Sudah ditinjau" },
+  { key: "correct", label: "OCR benar" },
+  { key: "wrong", label: "OCR salah" },
+  { key: "illegible", label: "Tidak terbaca" },
+];
+
 const CONFIDENCES = [
   { key: "", label: "Semua confidence" },
   { key: "0.5", label: "Confidence ≥ 50%" },
@@ -42,7 +58,10 @@ export default function Plates() {
   const [total, setTotal] = useState(0);
   const [classCounts, setClassCounts] = useState<Record<string, number>>({});
   const [sources, setSources] = useState<Source[]>([]);
-  const [evidence, setEvidence] = useState<Plate | null>(null);
+  // The row being looked at, held as its index in the current page rather than
+  // as the row itself: reviewing walks the listing with the arrows and with
+  // save-and-next, and an index is what "next" means. -1 = closed.
+  const [cursor, setCursor] = useState(-1);
   const [error, setError] = useState("");
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   // Rows shift under the cursor every five seconds, which makes comparing two
@@ -56,6 +75,8 @@ export default function Plates() {
   const sourceId = params.get("source") ? Number(params.get("source")) : undefined;
   const vehicleClass = params.get("class") ?? "";
   const minConfidence = params.get("conf") ?? "";
+  const rawReview = params.get("review") as ReviewFilter;
+  const review: "" | ReviewFilter = REVIEW_FILTERS.includes(rawReview) ? rawReview : "";
   const range = params.get("range") ?? "";
   const urlQ = params.get("q") ?? "";
   const page = Math.max(0, Number(params.get("page") ?? 0) || 0);
@@ -72,7 +93,7 @@ export default function Plates() {
     setParams(p, { replace: true });
   };
 
-  const filtered = Boolean(sourceId || vehicleClass || minConfidence || range || urlQ);
+  const filtered = Boolean(sourceId || vehicleClass || minConfidence || range || urlQ || review);
   const resetFilters = () =>
     setParams(sort === "timestamp" && order === "desc" ? {} : { sort, order }, { replace: true });
 
@@ -102,6 +123,7 @@ export default function Plates() {
           vehicle_class: vehicleClass || undefined,
           q: urlQ || undefined,
           min_confidence: minConfidence ? Number(minConfidence) : undefined,
+          review: review || undefined,
           from: ms ? new Date(Date.now() - ms).toISOString() : undefined,
           sort,
           order,
@@ -118,6 +140,12 @@ export default function Plates() {
         if (!cancelled) setError(err?.message ?? "Gagal memuat data");
       }
     };
+    // Reviewing walks this exact array by index, so nothing may refetch while
+    // the modal is open -- not the five-second poll, and not the load this
+    // effect would otherwise run the moment `cursor` changed, which would swap
+    // the array out from under the row that was just opened. Closing the modal
+    // sets cursor back to -1 and brings the listing up to date in one go.
+    if (cursor >= 0) return;
     load();
     if (!live) return () => void (cancelled = true);
     const t = setInterval(load, 5000);
@@ -125,7 +153,7 @@ export default function Plates() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [sourceId, vehicleClass, urlQ, minConfidence, range, sort, order, page, live, reloads]);
+  }, [sourceId, vehicleClass, urlQ, minConfidence, review, range, sort, order, page, live, reloads, cursor]);
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -136,6 +164,23 @@ export default function Plates() {
   }, [page, pageCount]);
 
   const nameOf = (id: number) => sources.find((s) => s.id === id)?.name ?? `#${id}`;
+
+  const evidence = cursor >= 0 && cursor < plates.length ? plates[cursor] : null;
+
+  // A saved review replaces the row in place rather than refetching the page.
+  // Refetching under the "Belum ditinjau" filter would drop the row the moment
+  // it was reviewed, renumbering everything after it -- so "next" would skip a
+  // read every time, which is the one thing a review queue must not do.
+  const onReviewed = (updated: Plate) =>
+    setPlates((rows) => rows.map((r) => (r.id === updated.id ? updated : r)));
+
+  // Walking off either end closes rather than wrapping: the end of the page is
+  // a real boundary, and silently starting over hides that the page is done.
+  const onStep = (delta: number) =>
+    setCursor((c) => {
+      const next = c + delta;
+      return next < 0 || next >= plates.length ? -1 : next;
+    });
 
   const onSort = (col: PlateSortKey) =>
     patch(
@@ -156,7 +201,13 @@ export default function Plates() {
 
   return (
     <div>
-      <PlateEvidenceModal plate={evidence} onClose={() => setEvidence(null)} />
+      <PlateEvidenceModal
+        plate={evidence}
+        onClose={() => setCursor(-1)}
+        onReviewed={onReviewed}
+        onStep={onStep}
+        position={evidence ? `${cursor + 1} / ${plates.length}` : undefined}
+      />
 
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <h1 className="text-2xl font-semibold">Plat Nomor</h1>
@@ -224,6 +275,17 @@ export default function Plates() {
             {CONFIDENCES.map((c) => (
               <option key={c.key} value={c.key}>
                 {c.label}
+              </option>
+            ))}
+          </Select>
+          <Select
+            value={review}
+            onChange={(v) => patch({ review: v })}
+            aria-label="Filter tinjauan"
+          >
+            {REVIEWS.map((r) => (
+              <option key={r.key} value={r.key}>
+                {r.label}
               </option>
             ))}
           </Select>
@@ -301,13 +363,14 @@ export default function Plates() {
               <SortHeader col="confidence" sort={sort} order={order} onSort={onSort}>
                 Confidence
               </SortHeader>
+              <th className="p-3">Tinjauan</th>
               <SortHeader col="timestamp" sort={sort} order={order} onSort={onSort}>
                 Waktu
               </SortHeader>
             </tr>
           </thead>
           <tbody>
-            {plates.map((p) => (
+            {plates.map((p, i) => (
               <tr key={p.id} className="border-t border-slate-800 hover:bg-slate-900/50">
                 <td className="p-3">
                   {p.has_image ? (
@@ -326,8 +389,8 @@ export default function Plates() {
                       src={api.plateFrameUrl(p.id)}
                       alt="kendaraan"
                       loading="lazy"
-                      onClick={() => setEvidence(p)}
-                      title="Lihat frame penuh"
+                      onClick={() => setCursor(i)}
+                      title="Lihat frame penuh dan koreksi nomornya"
                       className="h-16 w-28 cursor-zoom-in rounded border border-slate-700 object-cover hover:border-sky-500"
                     />
                   ) : (
@@ -335,17 +398,37 @@ export default function Plates() {
                   )}
                 </td>
                 <td className="p-3 font-mono text-base font-semibold tracking-wider">
-                  {p.plate_text ? (
-                    <Highlight text={p.plate_text} needle={needle} />
+                  {/* The human's answer where there is one, because it is the
+                      better answer -- but never at the cost of hiding what OCR
+                      said, which is struck through underneath. A corrected row
+                      that showed only the correction would look like a row the
+                      reader got right. */}
+                  {plateAnswer(p) ? (
+                    <button
+                      onClick={() => setCursor(i)}
+                      title="Lihat dan koreksi pembacaan ini"
+                      className="text-left hover:text-sky-300"
+                    >
+                      <Highlight text={plateAnswer(p)} needle={needle} />
+                      {p.corrected_text && p.corrected_text !== p.plate_text && p.plate_text && (
+                        <span
+                          className="ml-2 font-sans text-xs font-normal text-slate-500 line-through"
+                          title="Yang dibaca OCR"
+                        >
+                          {p.plate_text}
+                        </span>
+                      )}
+                    </button>
                   ) : (
                     // A capture (ALPR_CAPTURE_CLASSES): the vehicle passed
                     // through the zone but its plate was never read.
-                    <span
-                      className="font-sans text-xs font-normal text-slate-500"
-                      title="Terekam di zona ANPR, plat belum terbaca"
+                    <button
+                      onClick={() => setCursor(i)}
+                      className="font-sans text-xs font-normal text-slate-500 hover:text-sky-300"
+                      title="Terekam di zona ANPR, plat belum terbaca -- klik untuk mengisinya sendiri"
                     >
                       belum terbaca
-                    </span>
+                    </button>
                   )}
                 </td>
                 <td className="p-3">
@@ -355,6 +438,9 @@ export default function Plates() {
                 <td className="p-3">
                   <ConfidenceBadge value={p.confidence} />
                 </td>
+                <td className="p-3">
+                  <ReviewBadge plate={p} />
+                </td>
                 <td className="p-3 text-slate-400" title={new Date(p.timestamp).toLocaleString()}>
                   {relativeTime(p.timestamp)}
                 </td>
@@ -362,7 +448,7 @@ export default function Plates() {
             ))}
             {plates.length === 0 && (
               <tr>
-                <td colSpan={7} className="p-8 text-center text-slate-500">
+                <td colSpan={8} className="p-8 text-center text-slate-500">
                   {filtered ? (
                     <>
                       Tidak ada plat yang cocok dengan filter ini.{" "}

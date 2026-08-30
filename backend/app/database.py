@@ -56,8 +56,36 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # otherwise read back as None, and SourceOut.auto_start is a bool.
     ("sources", "auto_start", "INTEGER NOT NULL DEFAULT 0"),
     ("plate_reads", "frame_path", "TEXT"),
+    # Human review of a read. All three nullable: an existing row has not been
+    # reviewed, and NULL is exactly how that is spelled (see models.PlateRead).
+    ("plate_reads", "corrected_text", "VARCHAR(30)"),
+    ("plate_reads", "reviewed_at", "DATETIME"),
+    ("plate_reads", "reviewed_by", "VARCHAR(120)"),
     ("face_sightings", "frame_path", "TEXT"),
 )
+
+
+# Indexes for those columns. create_all() builds a table's indexes when it
+# builds the table, and ALTER TABLE ADD COLUMN builds none -- so on a database
+# that already existed, an index=True in the model is a statement about what a
+# *fresh* install gets and nothing else. Named exactly as SQLAlchemy names
+# them, so a fresh install and an upgraded one end up with the same schema
+# rather than two indexes doing one job.
+_ADDED_INDEXES: tuple[tuple[str, str, str], ...] = (
+    ("ix_plate_reads_corrected_text", "plate_reads", "corrected_text"),
+    ("ix_plate_reads_reviewed_at", "plate_reads", "reviewed_at"),
+)
+
+
+def _add_missing_indexes() -> None:
+    with engine.begin() as conn:
+        for name, table, column in _ADDED_INDEXES:
+            rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            if column not in {r[1] for r in rows}:
+                continue  # the column itself is not there yet
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"
+            )
 
 
 def _add_missing_columns() -> None:
@@ -79,3 +107,4 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
+    _add_missing_indexes()

@@ -19,7 +19,7 @@ from .detection.manager import SHUTTING_DOWN, get_manager, init_manager
 from .models import Source
 from .retention import start_scheduler, stop_scheduler
 from . import runtime
-from .api import auth_routes, counts, faces, plates, sources, streams
+from .api import auth_routes, counts, dataset, faces, plates, sources, streams
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
@@ -210,6 +210,7 @@ for _router in (
     counts.router,
     plates.router,
     faces.router,
+    dataset.router,
 ):
     app.include_router(_router, prefix="/api")
 

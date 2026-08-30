@@ -1,5 +1,13 @@
 """Retention: delete count events and plate reads (plus their images) older
 than ``settings.retention_days``. Runs periodically via APScheduler.
+
+One exception, and it matters: a plate read somebody has **reviewed** is never
+purged. Reviewing a read costs a person a few seconds of looking at a crop, and
+the result -- what OCR said against what the plate really was -- is the only
+ground truth this system has. Retention runs on a seven-day timer; without this
+exemption a fortnight of labelling would simply evaporate, and it would do so
+silently. Reviewed rows are a handful next to the traffic, and they are the
+handful worth keeping.
 """
 from __future__ import annotations
 
@@ -26,9 +34,8 @@ def purge_old_data() -> dict:
     removed_sightings = 0
     try:
         # Delete plate images on disk first, then their rows.
-        old_plates = db.scalars(
-            select(PlateRead).where(PlateRead.timestamp < cutoff)
-        ).all()
+        expired = (PlateRead.timestamp < cutoff, PlateRead.reviewed_at.is_(None))
+        old_plates = db.scalars(select(PlateRead).where(*expired)).all()
         for pr in old_plates:
             # Both the crop and the full-frame evidence image.
             for rel in (pr.image_path, pr.frame_path):
@@ -38,9 +45,7 @@ def purge_old_data() -> dict:
                     (settings.data_dir / rel).unlink(missing_ok=True)
                 except Exception:
                     pass
-        removed_plates = db.execute(
-            delete(PlateRead).where(PlateRead.timestamp < cutoff)
-        ).rowcount or 0
+        removed_plates = db.execute(delete(PlateRead).where(*expired)).rowcount or 0
 
         # Face sightings (EnrolledFace is reference data and never purged).
         old_sightings = db.scalars(

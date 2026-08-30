@@ -63,13 +63,21 @@ BOTTOM_HALF = {"a": [0.0, 0.5], "b": [1.0, 1.0]}
 class StubALPR:
     """Stands in for the real ALPR: counts reads, returns whatever it is given."""
 
-    def __init__(self, result=None):
+    def __init__(self, result=None, located=None):
         self.result = result
+        # What the plate detector "finds". None means it found nothing, which
+        # is the case the caller has to fall back from.
+        self.located = located
         self.calls = 0
+        self.locate_calls = 0
 
     def read_plate(self, crop):
         self.calls += 1
         return self.result
+
+    def locate_plate(self, crop):
+        self.locate_calls += 1
+        return self.located
 
 
 def reader(**kw) -> _PlateReader:
@@ -294,6 +302,147 @@ def test_a_read_class_is_read_not_captured():
     print("OK a_read_class_is_read_not_captured")
 
 
+# --- reading a capture more than once ---------------------------------------
+#
+# A capture used to get exactly one shot at OCR: taken as its row was written,
+# and only if the queue happened to be idle at that instant. One frame of a
+# moving motorcycle is a coin toss -- angled, motion-blurred, or half behind
+# the rider's leg -- and there was no second chance and nothing to vote with.
+# These pin the second chance down, and pin down that it stays free.
+
+
+def captured(r, det=None):
+    """Drive one capture through, and stand in for the row it would write.
+
+    ``row_id`` is what the ANPR thread sets once the capture has actually been
+    persisted; the re-read path keys off it, because a read is only worth
+    spending on a vehicle whose row exists to be corrected.
+    """
+    det = det or bike()
+    r.submit(frame(), [det])
+    vehicle = r._vehicles.get(r.offered[0][1])
+    vehicle.row_id = 99
+    r.offered.clear()
+    next_frame(r)
+    return vehicle
+
+
+def test_a_captured_motorcycle_gets_further_looks_at_its_plate():
+    r = reader(attempt_interval=1)
+    captured(r)
+    for _ in range(3):
+        r.submit(frame(), [bike()])
+        next_frame(r)
+    kinds = [o[0] for o in r.offered]
+    assert kinds == ["read", "read", "read"], kinds
+    print(f"OK a_captured_motorcycle_gets_further_looks_at_its_plate: {len(kinds)} reads")
+
+
+def test_those_further_looks_never_take_a_waiting_job_s_place():
+    """The whole guarantee that this costs ALPR_CLASSES nothing: a re-read is
+    offered without eviction, so a full queue simply drops it."""
+    r = reader(attempt_interval=1)
+    captured(r)
+    r.submit(frame(), [bike()])
+    assert r.offered[0][2] is False, r.offered
+    print("OK those_further_looks_never_take_a_waiting_jobs_place")
+
+
+def test_re_reading_stops_at_the_configured_budget():
+    r = reader(attempt_interval=1, capture_read_attempts=3)
+    captured(r)
+    for _ in range(10):
+        r.submit(frame(), [bike()])
+        next_frame(r)
+    assert len(r.offered) == 3, r.offered
+    print(f"OK re_reading_stops_at_the_configured_budget: {len(r.offered)} of 10 frames")
+
+
+def test_zero_restores_the_old_one_shot_behaviour():
+    r = reader(attempt_interval=1, capture_read_attempts=0)
+    captured(r)
+    for _ in range(6):
+        r.submit(frame(), [bike()])
+        next_frame(r)
+    assert r.offered == [], r.offered
+    print("OK zero_restores_the_old_one_shot_behaviour")
+
+
+def test_a_plate_already_read_well_is_left_alone():
+    r = reader(attempt_interval=1)
+    vehicle = captured(r)
+    vehicle.votes.add("B6084TXB", 0.91)   # above _PLATE_GOOD_ENOUGH_CONF
+    for _ in range(4):
+        r.submit(frame(), [bike()])
+        next_frame(r)
+    assert r.offered == [], r.offered
+    print("OK a_plate_already_read_well_is_left_alone")
+
+
+def test_a_capture_with_no_row_yet_is_not_re_read():
+    """Nothing to correct: the capture was dropped or has not landed. Spending
+    OCR on it would produce a plate with nowhere to put it."""
+    r = reader(attempt_interval=1)
+    r.submit(frame(), [bike()])
+    r.offered.clear()
+    next_frame(r)
+    for _ in range(4):
+        r.submit(frame(), [bike()])
+        next_frame(r)
+    assert r.offered == [], r.offered
+    print("OK a_capture_with_no_row_yet_is_not_re_read")
+
+
+def test_a_bike_that_left_the_zone_is_not_re_read():
+    r = reader(attempt_interval=1)
+    captured(r)
+    for _ in range(3):
+        r.submit(frame(), [bike(y1=100, y2=200)])   # above the zone now
+        next_frame(r)
+    assert r.offered == [], r.offered
+    print("OK a_bike_that_left_the_zone_is_not_re_read")
+
+
+# --- which picture a capture files ------------------------------------------
+
+
+def _capture_image(located):
+    """The image _do_capture hands to _persist_plate, with the DB stubbed out."""
+    r = reader(alpr=StubALPR(located=located))
+    saved = {}
+
+    def fake_persist(source_id, tid, cls, text, conf, image, **kw):
+        saved["image"] = image
+        return 7
+
+    real, worker._persist_plate = worker._persist_plate, fake_persist
+    try:
+        vehicle_crop = np.zeros((300, 400, 3), dtype=np.uint8)
+        r._do_capture(1, 1, "motorcycle", vehicle_crop, None, (0, 0, 400, 300))
+    finally:
+        worker._persist_plate = real
+    return saved.get("image")
+
+
+def test_a_capture_files_the_plate_not_the_whole_motorcycle():
+    """The detector puts a tight box on the plate at high confidence in exactly
+    the frames the recogniser then makes nothing of. Three things read that
+    image -- the listing thumbnail, the reviewer correcting it, and the
+    exported training set -- and all three want the plate."""
+    plate = np.full((70, 158, 3), 200, dtype=np.uint8)
+    got = _capture_image(located=plate)
+    assert got.shape == plate.shape, got.shape
+    print(f"OK a_capture_files_the_plate_not_the_whole_motorcycle: {got.shape[1]}x{got.shape[0]}")
+
+
+def test_a_capture_falls_back_to_the_vehicle_when_no_plate_is_found():
+    """No detector, or nothing found: the passage is still the point, and a
+    picture of the vehicle beats no row at all."""
+    got = _capture_image(located=None)
+    assert got.shape == (300, 400, 3), got.shape
+    print("OK a_capture_falls_back_to_the_vehicle_when_no_plate_is_found")
+
+
 class BlockingALPR:
     """Holds the ANPR thread on its first job so the queue can be kept full."""
 
@@ -304,6 +453,9 @@ class BlockingALPR:
     def read_plate(self, crop):
         self.entered.set()
         self.release.wait(timeout=10)
+        return None
+
+    def locate_plate(self, crop):
         return None
 
 

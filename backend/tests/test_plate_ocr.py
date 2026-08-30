@@ -12,10 +12,14 @@ is a regression on real frames.
 
 Run from the backend/ directory:  python -m tests.test_plate_ocr
 """
+import tempfile
+from pathlib import Path
+
 import numpy as np
 
 from app.detection.alpr import (
-    ALPR, _text_lines, looks_like_plate, normalize_plate, repair_plate,
+    ALPR, _text_lines, _upscale, looks_like_plate, normalize_plate,
+    recogniser_kwargs, repair_plate,
 )
 
 
@@ -277,6 +281,146 @@ def test_a_reader_that_raises_does_not_escape():
     a._reader = Boom()
     assert a.read_plate(CROP) is None
     print("OK a_reader_that_raises_does_not_escape")
+
+
+# --- enlarging the crop before OCR ------------------------------------------
+#
+# The sizes here are the ones measured off the reviewed reads, not invented.
+# What this section guards is the failure that hid in plain sight for a while:
+# the 1.5x floor, meant to skip a pointless marginal resize, was instead
+# swallowing the median plate whole.
+
+def test_the_median_real_crop_is_actually_enlarged():
+    """172x74 is the median plate crop off these cameras.
+
+    Against the old 64/240 targets it asked for 240/172 = 1.40x, fell under
+    the 1.5x floor and went to OCR untouched -- as did 57% of the reviewed
+    crops. Half of all reads were coming back missing characters.
+    """
+    crop = np.zeros((74, 172), dtype=np.uint8)
+    out = _upscale(crop, 160, 600)
+    assert out.shape[0] > 74 and out.shape[1] > 172, out.shape
+    # Old targets, same crop: the regression this pins.
+    assert _upscale(crop, 64, 240).shape == crop.shape
+
+
+def test_the_width_term_is_what_binds_on_a_plate():
+    """A plate is wide and short, so 600/w outruns 160/h and sets the scale.
+
+    Which is why the targets survive a change of camera distance: whether the
+    crop arrives 172 px or 226 px wide, it leaves about 600 px across.
+    """
+    for w, h in ((172, 74), (226, 92), (120, 60)):
+        out = _upscale(np.zeros((h, w), dtype=np.uint8), 160, 600)
+        assert abs(out.shape[1] - 600) <= 6, (w, h, out.shape)
+
+
+def test_a_crop_that_is_already_big_enough_is_left_alone():
+    """The floor still has a job -- it is just no longer doing it to plates."""
+    big = np.zeros((300, 900), dtype=np.uint8)
+    assert _upscale(big, 160, 600).shape == big.shape
+
+
+def test_enlargement_is_still_capped():
+    """Past the cap this is inventing detail, not revealing it."""
+    tiny = np.zeros((20, 40), dtype=np.uint8)
+    out = _upscale(tiny, 160, 600, cap=6.0)
+    assert out.shape[1] <= 40 * 6, out.shape
+
+
+# --- loading a custom recogniser --------------------------------------------
+#
+# This is the slot a recogniser fine-tuned on the exported dataset plugs into.
+# Nothing here loads a model: what is worth pinning is the decision made before
+# one is loaded, because getting it wrong takes ANPR down rather than merely
+# leaving it less accurate.
+
+def test_no_recogniser_configured_asks_easyocr_for_nothing():
+    """The default has to stay the stock reader, with no directories invented."""
+    kwargs, missing = recogniser_kwargs("", "/models", "/nets")
+    assert kwargs == {} and missing == []
+    # "standard" is spelled out in .env files as much as left empty.
+    assert recogniser_kwargs("standard", "/models", "/nets") == ({}, [])
+    print("OK no_recogniser_configured_asks_for_nothing")
+
+
+def test_easyocrs_own_networks_are_named_but_never_looked_for_on_disk():
+    """EasyOCR downloads these itself; checking a local path would reject them."""
+    kwargs, missing = recogniser_kwargs("english_g2", "/nonexistent", "/nonexistent")
+    assert kwargs == {"recog_network": "english_g2"}
+    assert missing == []
+    print("OK stock_networks_are_not_looked_for_on_disk")
+
+
+def test_a_custom_recogniser_names_all_three_files_it_needs():
+    """A fine-tune is three files, and it is usually the .py that got left out.
+
+    EasyOCR stops at the first one it cannot open, so reporting them one at a
+    time would cost a restart per file.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "plate_id_v1.pth").write_bytes(b"")
+        kwargs, missing = recogniser_kwargs("plate_id_v1", tmp, tmp)
+        assert kwargs["recog_network"] == "plate_id_v1"
+        assert kwargs["model_storage_directory"] == tmp
+        assert kwargs["user_network_directory"] == tmp
+        assert len(missing) == 2, missing
+        assert any(m.endswith("plate_id_v1.yaml") for m in missing)
+        assert any(m.endswith("plate_id_v1.py") for m in missing)
+    print("OK a_custom_recogniser_names_all_three: both reported at once")
+
+
+def test_a_complete_recogniser_reports_nothing_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        for ext in ("pth", "yaml", "py"):
+            (Path(tmp) / f"plate_id_v1.{ext}").write_bytes(b"")
+        kwargs, missing = recogniser_kwargs("plate_id_v1", tmp, tmp)
+        assert missing == [], missing
+        assert kwargs["recog_network"] == "plate_id_v1"
+    print("OK a_complete_recogniser_reports_nothing_missing")
+
+
+def test_the_architecture_can_live_apart_from_the_weights():
+    """EasyOCR keeps the two directories separate; so does the config."""
+    with tempfile.TemporaryDirectory() as tmp:
+        models, nets = Path(tmp) / "weights", Path(tmp) / "user_network"
+        models.mkdir()
+        nets.mkdir()
+        (models / "plate_id_v1.pth").write_bytes(b"")
+        (nets / "plate_id_v1.yaml").write_bytes(b"")
+        (nets / "plate_id_v1.py").write_bytes(b"")
+        kwargs, missing = recogniser_kwargs("plate_id_v1", str(models), str(nets))
+        assert missing == [], missing
+        assert kwargs["model_storage_directory"] == str(models)
+        assert kwargs["user_network_directory"] == str(nets)
+    print("OK the_architecture_can_live_apart_from_the_weights")
+
+
+def test_an_empty_network_dir_falls_back_to_the_weights_dir():
+    """One folder holding all three files is how a fine-tune usually arrives."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for ext in ("pth", "yaml", "py"):
+            (Path(tmp) / f"plate_id_v1.{ext}").write_bytes(b"")
+        kwargs, missing = recogniser_kwargs("plate_id_v1", tmp, "")
+        assert missing == [], missing
+        assert kwargs["user_network_directory"] == tmp
+    print("OK an_empty_network_dir_falls_back_to_the_weights_dir")
+
+
+def test_a_missing_recogniser_is_reported_not_raised():
+    """The whole reason this check exists rather than letting EasyOCR raise.
+
+    A mistyped OCR_RECOG_NETWORK should cost accuracy for a day, not plate
+    reading: the caller drops the kwargs and runs stock. Anything that threw
+    here would instead be caught by ALPR.__init__ as "could not init EasyOCR",
+    leaving the worker with alpr = None and no plate reading at all.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        kwargs, missing = recogniser_kwargs("typo_v1", tmp, tmp)
+        assert len(missing) == 3, missing
+        # Returned anyway: it is the caller that decides to drop them.
+        assert kwargs["recog_network"] == "typo_v1"
+    print("OK a_missing_recogniser_is_reported_not_raised")
 
 
 if __name__ == "__main__":
