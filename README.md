@@ -552,8 +552,10 @@ per worker.
   daerah platnya (crop utuh, lalu pita bawah kendaraan) — bisa jalan, tapi
   detektor khusus tetap peningkatan akurasi terbesar yang bisa Anda pasang.
   Di GPU biayanya nyaris nol.
-- **Motor direkam walau platnya tidak terbaca** — `ALPR_CAPTURE_CLASSES=motorcycle`,
-  lihat bagian di bawah.
+- **Kendaraan direkam walau platnya tidak terbaca** —
+  `ALPR_CAPTURE_CLASSES=car,truck,motorcycle,person`. Untuk motor karena platnya
+  memang jarang terbaca dari kamera overview, untuk mobil karena setelah gelap
+  praktis tidak ada plat yang terbaca sama sekali. Lihat bagian di bawah.
 - **Percobaan ANPR lebih longgar** — `ALPR_MAX_ATTEMPTS=24`,
   `ALPR_ATTEMPT_INTERVAL=2` (profil CPU: 12 dan 3). Lebih banyak percobaan per
   kendaraan berarti lebih besar peluang menangkap satu frame di mana platnya
@@ -746,9 +748,42 @@ mengatur itu.
 160 px itu soal apakah *plat*-nya bisa terbaca dan akan menolak hampir semua
 motor. Capture cuma perlu memperlihatkan kendaraannya.
 
-Kelas yang sudah ada di `ALPR_CLASSES` tidak ikut di-capture: kelas itu sudah
-punya jatah percobaan penuh, dan merekamnya juga berarti satu baris untuk
-setiap kendaraan yang masuk zona.
+#### Mobil yang platnya tidak terbaca — malam hari
+
+Kelas yang ada di `ALPR_CLASSES` **boleh** ikut di `ALPR_CAPTURE_CLASSES`, dan
+kalau begitu ia dapat dua-duanya: tetap dibaca platnya dengan jatah percobaan
+penuh, tapi kalau tidak ada satu pun percobaan yang berhasil, kendaraannya
+tetap ditulis satu baris.
+
+```dotenv
+ALPR_CLASSES=car,truck,bus
+ALPR_CAPTURE_CLASSES=car,truck,motorcycle,person
+```
+
+Yang mengharuskan ini adalah gelap. Terukur di kamera gang proyek ini, dengan
+pipeline dan setelan yang sama persis:
+
+| | mobil lolos gerbang zona | platnya terbaca |
+|---|---|---|
+| Siang (13:00–17:30) | 22 | **17** (77%) |
+| Malam (setelah 18:40) | 16 | **0** |
+
+Mobilnya tetap lewat — line counter mencatat 9, 4 dan 7 mobil pada jam 19, 20
+dan 21 — dan gerbang zonanya lolos semua. Yang gagal cuma OCR-nya. Tanpa
+capture, tiap malam mobil hilang sama sekali dari daftar, persis keluhan yang
+`ALPR_CAPTURE_CLASSES` ada untuk menjawab; itu tidak pernah cuma soal motor.
+
+Urutannya: capture lebih dulu (satu baris, `plate_text` kosong), pembacaan plat
+menyusul di frame berikutnya dan mengisi **baris yang sama**. Kalau justru
+platnya yang lebih dulu terbaca, capture-nya mundur — baris hasil baca sudah
+menjadi catatan perjalanan itu, dan menimpanya justru akan mengosongkan plat
+yang sudah berhasil dieja.
+
+Biayanya baris dan disk, bukan GPU: satu baris + satu crop + satu frame penuh
+(~2 MB dengan `ALPR_SAVE_FRAME` menyala) per mobil yang lewat, bukan per frame.
+Pada ~10 mobil/jam per kamera itu sekitar 250 baris dan ~500 MB per hari per
+kamera. Keluarkan `car,truck` dari `ALPR_CAPTURE_CLASSES` kalau Anda hanya mau
+baris yang platnya benar-benar terbaca.
 
 #### Orang di zona ANPR
 
@@ -1509,9 +1544,9 @@ memang bisa berhasil.
 | `ALPR_READ_ALL_ATTEMPTS` | true | habiskan jatah percobaan supaya semua pembacaan ikut voting; `false` = berhenti di pembacaan pertama yang meyakinkan (lebih hemat antrean OCR) |
 | `ALPR_CLASSES` | `car,truck,bus` | kelas yang platnya dibaca; motor sengaja tidak termasuk |
 | `ALPR_MIN_VEHICLE_WIDTH` | 160 | lebar minimum box kendaraan (piksel) sebelum plat dicoba dibaca |
-| `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, terbaca/dikenali atau tidak; `motorcycle,person` |
+| `ALPR_CAPTURE_CLASSES` | *(kosong)* | kelas yang direkam begitu masuk **zona ANPR**, terbaca/dikenali atau tidak; `car,truck,motorcycle,person`. Kelas yang juga ada di `ALPR_CLASSES` dapat dua-duanya: dibaca platnya, dan tetap jadi baris kalau tidak terbaca |
 | `ALPR_CAPTURE_MIN_WIDTH` | 48 | lebar minimum box sebelum di-capture (terpisah dari ambang baca di atas) |
-| `ALPR_CAPTURE_READ_ATTEMPTS` | 8 | berapa frame plat sebuah capture boleh dicoba baca ulang; hanya saat antrean OCR kosong, 0 = satu tembakan seperti dulu |
+| `ALPR_CAPTURE_READ_ATTEMPTS` | 8 | berapa frame plat sebuah capture boleh dicoba baca ulang; hanya saat antrean OCR kosong, 0 = satu tembakan seperti dulu. Tidak berlaku untuk kelas yang juga ada di `ALPR_CLASSES` — kelas itu sudah punya jatah penuh `ALPR_MAX_ATTEMPTS` |
 | `ALPR_ZONE_MIN_OVERLAP` | 0.5 | bagian kotak kendaraan yang harus di dalam zona ANPR sebelum **dibaca** |
 | `ALPR_CAPTURE_CONTAINMENT` | 0.99 | bagian kendaraan yang harus di dalam zona sebelum **di-capture** — 0.99 ≈ utuh, sisakan 1 px goyangan deteksi |
 | `ALPR_CAPTURE_DEDUPE_SECONDS` | 3.0 | berapa lama sebuah capture diingat untuk dibandingkan dengan capture berikutnya (0 = matikan) |

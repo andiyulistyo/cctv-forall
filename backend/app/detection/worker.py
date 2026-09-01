@@ -1040,10 +1040,32 @@ class _PlateReader:
 
             if vehicle.vid in self._pending:
                 continue
-            if capturable and not readable:
+            if capturable:
+                # A class listed in both settings gets both, and in this order.
+                # A car whose plate cannot be read -- at night that is most of
+                # them -- would otherwise leave no trace at all, which is the
+                # complaint ALPR_CAPTURE_CLASSES exists to answer; it is not a
+                # complaint only about motorcycles. The capture records the
+                # passage and the read fills its plate into that same row
+                # afterwards, through ``vehicle.row_id``.
                 self._maybe_capture(vehicle, det, frame, (x1, y1, x2, y2), now, faces)
-                self._maybe_reread(vehicle, det, frame, (x1, y1, x2, y2), now)
-                continue
+                if not readable:
+                    # Capture-only, so no read budget will ever be spent on
+                    # this vehicle and the subordinate re-read is its only
+                    # chance at a plate. It runs on an idle queue and so costs
+                    # ALPR_CLASSES nothing.
+                    self._maybe_reread(vehicle, det, frame, (x1, y1, x2, y2), now)
+                    continue
+                # Readable as well: the ordinary read below is this vehicle's
+                # attempt, and _maybe_reread would only duplicate it on a
+                # budget it already has. But that read waits a frame when a
+                # capture has just been queued. Both jobs carry the same vid,
+                # and _offer leaves the pending mark alone when it evicts a job
+                # of the same vid -- so a read offered now could drop the
+                # capture with nothing downstream noticing the passage had
+                # gone. The vehicle is still there next frame.
+                if vehicle.vid in self._pending:
+                    continue
             if not self._read_all_attempts and vehicle.best_conf >= _PLATE_GOOD_ENOUGH_CONF:
                 continue  # already read well; spend the budget elsewhere
             attempts = vehicle.attempts
@@ -1158,14 +1180,20 @@ class _PlateReader:
         *passage* rather than once per attempt, and the row it writes is
         complete on its own with plate_text left empty.
 
-        Three things have to agree that this is a passage we do not already
-        have. ``vehicle.captured`` is the cheap one and catches the ordinary
-        case. The other two are there because on a zoomed-in camera the tracker
-        loses vehicles often enough that identity alone does not hold: the gate
-        will not take a vehicle that is only half inside the zone, and it
-        remembers what it captured a moment ago so one vehicle reported as two
-        nested boxes is not recorded twice. See ``capture_gate`` for the
-        measurements behind both.
+        A class in ALPR_CLASSES comes through here too, and then the two paths
+        share one row: whichever lands first writes it, and the other corrects
+        it in place. That is what gives a car a record on a night its plate
+        cannot be read -- but it also means a capture must stand down once a
+        read has a row, or it would blank the very plate that was made out.
+
+        Four things have to agree that this is a passage we do not already
+        have. ``vehicle.captured`` and ``vehicle.row_id`` are the cheap ones and
+        catch the ordinary case. The other two are there because on a zoomed-in
+        camera the tracker loses vehicles often enough that identity alone does
+        not hold: the gate will not take a vehicle that is only half inside the
+        zone, and it remembers what it captured a moment ago so one vehicle
+        reported as two nested boxes is not recorded twice. See ``capture_gate``
+        for the measurements behind both.
 
         Deliberately cheap and non-competitive. It queues no OCR of its own;
         the read, if any, is attempted by the worker thread only when nothing
@@ -1175,6 +1203,13 @@ class _PlateReader:
         x1, y1, x2, y2 = box
         if vehicle.captured:
             return  # already recorded; survives the tracker renumbering it
+        if vehicle.row_id is not None:
+            # Its plate was read on the way in, and that read is already a row
+            # for this passage. Capturing it now would not add a second row --
+            # it would overwrite the one we have, because _do_capture writes
+            # empty plate text into ``vehicle.row_id`` and _persist_plate takes
+            # what it is given. Only reachable for a class in both settings.
+            return
         if x2 - x1 < self._capture_min_width:
             return
         if not self._through_zone(frame, (x1, y1, x2, y2)):
